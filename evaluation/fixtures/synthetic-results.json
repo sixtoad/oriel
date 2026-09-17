@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.0",
+  "provenance": "synthetic",
+  "corpus": {"id": "oriel-synthetic-baseline", "revision": 2},
+  "component": {"id": "oriel-fixture-runner", "revision": 1},
+  "model": {"id": "synthetic-model", "revision": 1},
+  "generation": {"strategy": "deterministic-fixture", "max_output_tokens": 64},
+  "conditions": {"load": "single-turn"},
+  "resource_profile": "anonymized-fixture-profile",
+  "method": "offline-fixture-scoring",
+  "samples": [
+    {
+      "sample_id": "text-cold-chat-success",
+      "case": {"id": "chat-greeting", "revision": 2},
+      "population": "text",
+      "thermal": "cold",
+      "terminal": "success",
+      "assessment": {"expected_correct": true, "observed_correct": true, "side_effect_outcome": "none"},
+      "anchor_monotonic_ms": 1000,
+      "stages": {
+        "wake": {"observed_monotonic_ms": 1005}, "end_of_turn": {"observed_monotonic_ms": 1010},
+        "final_transcript": {"observed_monotonic_ms": 1012}, "route": {"observed_monotonic_ms": 1014},
+        "first_model_token": {"observed_monotonic_ms": 1020}, "first_useful_content": {"observed_monotonic_ms": 1024},
+        "acknowledgement": {"observed_monotonic_ms": 1018}, "first_audio": {"unavailable_reason": "text-population"},
+        "static_validation": {"observed_monotonic_ms": 1016}, "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "text-population"}
+      }
+    },
+    {
+      "sample_id": "text-warm-dependency-failure",
+      "case": {"id": "dependency-timeout-reported", "revision": 1},
+      "population": "text",
+      "thermal": "warm",
+      "terminal": "failure",
+      "assessment": {"expected_correct": true, "observed_correct": false, "side_effect_outcome": "none"},
+      "anchor_monotonic_ms": 2000,
+      "stages": {
+        "wake": {"observed_monotonic_ms": 2003}, "end_of_turn": {"observed_monotonic_ms": 2008},
+        "final_transcript": {"observed_monotonic_ms": 2011}, "route": {"observed_monotonic_ms": 2013},
+        "first_model_token": {"unavailable_reason": "terminal-failure"}, "first_useful_content": {"unavailable_reason": "terminal-failure"},
+        "acknowledgement": {"observed_monotonic_ms": 2015}, "first_audio": {"unavailable_reason": "text-population"},
+        "static_validation": {"observed_monotonic_ms": 2016}, "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "text-population"}
+      }
+    },
+    {
+      "sample_id": "voice-cold-deferred",
+      "case": {"id": "audio-interruption-deferred", "revision": 1},
+      "population": "voice",
+      "thermal": "cold",
+      "terminal": "deferred",
+      "assessment": {"expected_correct": null, "observed_correct": null, "side_effect_outcome": "not_assessable"},
+      "anchor_monotonic_ms": 3000,
+      "stages": {
+        "wake": {"observed_monotonic_ms": 3007}, "end_of_turn": {"observed_monotonic_ms": 3018},
+        "final_transcript": {"observed_monotonic_ms": 3021}, "route": {"observed_monotonic_ms": 3023},
+        "first_model_token": {"unavailable_reason": "deferred-case"}, "first_useful_content": {"unavailable_reason": "deferred-case"},
+        "acknowledgement": {"observed_monotonic_ms": 3025}, "first_audio": {"unavailable_reason": "audio-unavailable"},
+        "static_validation": {"observed_monotonic_ms": 3026}, "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "audio-unavailable"}
+      }
+    },
+    {
+      "sample_id": "voice-warm-unsupported",
+      "case": {"id": "music-source-unavailable", "revision": 1},
+      "population": "voice",
+      "thermal": "warm",
+      "terminal": "unsupported",
+      "assessment": {"expected_correct": null, "observed_correct": null, "side_effect_outcome": "not_assessable"},
+      "anchor_monotonic_ms": 4000,
+      "stages": {
+        "wake": {"observed_monotonic_ms": 4006}, "end_of_turn": {"observed_monotonic_ms": 4017},
+        "final_transcript": {"observed_monotonic_ms": 4020}, "route": {"observed_monotonic_ms": 4022},
+        "first_model_token": {"unavailable_reason": "unsupported-case"}, "first_useful_content": {"unavailable_reason": "unsupported-case"},
+        "acknowledgement": {"uncertainty": "cross-system-event"}, "first_audio": {"unavailable_reason": "unsupported-case"},
+        "static_validation": {"observed_monotonic_ms": 4024}, "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "unsupported-case"}
+      }
+    }
+  ]
+}

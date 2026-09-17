@@ -1,0 +1,623 @@
+{
+  "groups": [
+    {
+      "correctness": {
+        "denominator": 1,
+        "numerator": 1,
+        "rate": 1.0
+      },
+      "counts": {
+        "deferred": 0,
+        "failure": 0,
+        "submitted": 1,
+        "success": 1,
+        "unsupported": 0
+      },
+      "population": "text",
+      "reliability": {
+        "denominator": 1,
+        "numerator": 1,
+        "rate": 1.0
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 1,
+        "not_assessable": 0,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 18,
+          "p95_ms": 18,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "action_completion": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "no-action-expected": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 10,
+          "p95_ms": 10,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "text-population": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 12,
+          "p95_ms": 12,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "text-population": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 20,
+          "p95_ms": 20,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 24,
+          "p95_ms": 24,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 14,
+          "p95_ms": 14,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 16,
+          "p95_ms": 16,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 5,
+          "p95_ms": 5,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "cold"
+    },
+    {
+      "correctness": {
+        "denominator": 1,
+        "numerator": 0,
+        "rate": 0.0
+      },
+      "counts": {
+        "deferred": 0,
+        "failure": 1,
+        "submitted": 1,
+        "success": 0,
+        "unsupported": 0
+      },
+      "population": "text",
+      "reliability": {
+        "denominator": 1,
+        "numerator": 0,
+        "rate": 0.0
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 1,
+        "not_assessable": 0,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 15,
+          "p95_ms": 15,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "action_completion": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "no-action-expected": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 8,
+          "p95_ms": 8,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "text-population": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 11,
+          "p95_ms": 11,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "text-population": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "terminal-failure": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "terminal-failure": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 13,
+          "p95_ms": 13,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 16,
+          "p95_ms": 16,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 3,
+          "p95_ms": 3,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "warm"
+    },
+    {
+      "correctness": {
+        "denominator": 0,
+        "numerator": 0,
+        "rate": null
+      },
+      "counts": {
+        "deferred": 1,
+        "failure": 0,
+        "submitted": 1,
+        "success": 0,
+        "unsupported": 0
+      },
+      "population": "voice",
+      "reliability": {
+        "denominator": 1,
+        "numerator": 0,
+        "rate": 0.0
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 0,
+        "not_assessable": 1,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 25,
+          "p95_ms": 25,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "action_completion": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "no-action-expected": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 18,
+          "p95_ms": 18,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "audio-unavailable": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 21,
+          "p95_ms": 21,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "audio-unavailable": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "deferred-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "deferred-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 23,
+          "p95_ms": 23,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 26,
+          "p95_ms": 26,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 7,
+          "p95_ms": 7,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "cold"
+    },
+    {
+      "correctness": {
+        "denominator": 0,
+        "numerator": 0,
+        "rate": null
+      },
+      "counts": {
+        "deferred": 0,
+        "failure": 0,
+        "submitted": 1,
+        "success": 0,
+        "unsupported": 1
+      },
+      "population": "voice",
+      "reliability": {
+        "denominator": 0,
+        "numerator": 0,
+        "rate": null
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 0,
+        "not_assessable": 1,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 1,
+          "uncertainty_reasons": {
+            "cross-system-event": 1
+          }
+        },
+        "action_completion": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "no-action-expected": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 17,
+          "p95_ms": 17,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "unsupported-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 20,
+          "p95_ms": 20,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "unsupported-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "unsupported-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "unsupported-case": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 22,
+          "p95_ms": 22,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 24,
+          "p95_ms": 24,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 1,
+          "observed": 1,
+          "p50_ms": 6,
+          "p95_ms": 6,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "warm"
+    }
+  ],
+  "measurement": {
+    "component": {
+      "id": "oriel-fixture-runner",
+      "revision": 1
+    },
+    "conditions": {
+      "load": "single-turn"
+    },
+    "corpus": {
+      "id": "oriel-synthetic-baseline",
+      "revision": 2
+    },
+    "generation": {
+      "max_output_tokens": 64,
+      "strategy": "deterministic-fixture"
+    },
+    "method": "offline-fixture-scoring",
+    "model": {
+      "id": "synthetic-model",
+      "revision": 1
+    },
+    "provenance": "synthetic",
+    "resource_profile": "anonymized-fixture-profile"
+  },
+  "schema_version": "1.0"
+}
