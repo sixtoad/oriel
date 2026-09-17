@@ -12,6 +12,10 @@ release gate pass. No gateway, model service, scoring runner, voice pipeline,
 or approval implementation is included. Python is the offline tooling choice;
 it does not choose the future gateway runtime.
 
+For the separate offline measurement-result format and its fully synthetic
+scoring demo, see [RESULTS.md](RESULTS.md). Corpus validation itself remains
+definition validation only; it does not create measurement output.
+
 ## Run offline
 
 From the repository root, with Python 3.12 and no dependencies to install:

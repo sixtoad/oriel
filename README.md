@@ -13,3 +13,11 @@ its definitions and run its tests with Python 3.12:
 python3 scripts/validate_corpus.py evaluation/corpus.json
 python3 -m unittest discover -s tests -v
 ```
+
+The [offline measurement-result format](evaluation/RESULTS.md) separately
+scores supplied, sanitized fixture events. Its committed demo is synthetic and
+does not claim a baseline, Oriel capability, performance, or release result:
+
+```sh
+python3 scripts/score_results.py evaluation/fixtures/synthetic-results.json
+```
