@@ -21,3 +21,7 @@ does not claim a baseline, Oriel capability, performance, or release result:
 ```sh
 python3 scripts/score_results.py evaluation/fixtures/synthetic-results.json
 ```
+
+A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
+replays a real existing local-Qwen backend measurement. It is deliberately
+limited to the text backend and does not represent full Assist or voice evidence.

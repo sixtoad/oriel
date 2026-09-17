@@ -12,6 +12,9 @@ RESULTS = ROOT / "evaluation/fixtures/synthetic-results.json"
 GOLDEN = ROOT / "evaluation/fixtures/synthetic-summary.json"
 CORPUS = ROOT / "evaluation/corpus.json"
 CLI = ROOT / "scripts/score_results.py"
+CAPTURE = ROOT / "evaluation/captures/2026-09-17-reference-text/results.json"
+CAPTURE_GOLDEN = ROOT / "evaluation/captures/2026-09-17-reference-text/summary.json"
+CAPTURE_DIRECTORY = CAPTURE.parent
 SENTINEL = "PRIVATE_PAYLOAD_MUST_NOT_APPEAR"
 
 
@@ -53,6 +56,27 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(first.stderr, "")
         self.assertEqual(first.stdout, expected)
         self.assertEqual(first.stdout, second.stdout)
+
+    def test_committed_sanitized_capture_replays_offline_without_private_endpoints(self):
+        result = self.cli(CAPTURE, offline_guard=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, CAPTURE_GOLDEN.read_text(encoding="utf-8"))
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["measurement"]["provenance"], "captured_sanitized")
+        group = summary["groups"][0]
+        self.assertEqual((group["population"], group["thermal"]), ("text", "warm"))
+        self.assertEqual(group["stages"]["first_useful_content"]["p95_ms"], 6475.62)
+        self.assertEqual(group["stages"]["first_model_token"]["unavailable_reasons"], {"non-streaming-client": 2})
+        voice = summary["groups"][1]
+        self.assertEqual((voice["population"], voice["thermal"]), ("voice", "warm"))
+        self.assertEqual(voice["counts"]["unsupported"], 1)
+        self.assertEqual(voice["stages"]["first_audio"]["unavailable_reasons"], {"assist-entry-uninstrumented": 1})
+        for path in CAPTURE_DIRECTORY.iterdir():
+            content = path.read_text(encoding="utf-8").lower()
+            for forbidden in ("http://", "https://", "cantolla", "192.168.", "172.30.", "sk-"):
+                with self.subTest(path=path.name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, content)
 
     def test_groups_denominators_and_unavailable_stages_are_preserved(self):
         result = self.cli(RESULTS)

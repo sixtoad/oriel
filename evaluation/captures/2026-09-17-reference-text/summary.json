@@ -1,0 +1,349 @@
+{
+  "groups": [
+    {
+      "correctness": {
+        "denominator": 2,
+        "numerator": 2,
+        "rate": 1.0
+      },
+      "counts": {
+        "deferred": 0,
+        "failure": 0,
+        "submitted": 2,
+        "success": 2,
+        "unsupported": 0
+      },
+      "population": "text",
+      "reliability": {
+        "denominator": 2,
+        "numerator": 2,
+        "rate": 1.0
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 2,
+        "not_assessable": 0,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "direct-backend-capture": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "action_completion": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "no-action-expected": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "direct-text-request": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "text-population": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "direct-text-request": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "text-population": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "non-streaming-client": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 2,
+          "observed": 2,
+          "p50_ms": 6339.21,
+          "p95_ms": 6475.62,
+          "unavailable": 0,
+          "unavailable_reasons": {},
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "direct-backend-request": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "no-tool-dispatch": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 2,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 2,
+          "unavailable_reasons": {
+            "text-population": 2
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "warm"
+    },
+    {
+      "correctness": {
+        "denominator": 0,
+        "numerator": 0,
+        "rate": null
+      },
+      "counts": {
+        "deferred": 0,
+        "failure": 0,
+        "submitted": 1,
+        "success": 0,
+        "unsupported": 1
+      },
+      "population": "voice",
+      "reliability": {
+        "denominator": 0,
+        "numerator": 0,
+        "rate": null
+      },
+      "side_effect_outcomes": {
+        "expected": 0,
+        "none": 0,
+        "not_assessable": 1,
+        "unexpected": 0
+      },
+      "stages": {
+        "acknowledgement": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "action_completion": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "end_of_turn": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "final_transcript": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_audio": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_model_token": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "first_useful_content": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "route": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "static_validation": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        },
+        "wake": {
+          "eligible": 1,
+          "observed": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "unavailable": 1,
+          "unavailable_reasons": {
+            "assist-entry-uninstrumented": 1
+          },
+          "uncertain": 0,
+          "uncertainty_reasons": {}
+        }
+      },
+      "thermal": "warm"
+    }
+  ],
+  "measurement": {
+    "component": {
+      "id": "reference-local-qwen-text-backend",
+      "revision": 1
+    },
+    "conditions": {
+      "load": "single-request"
+    },
+    "corpus": {
+      "id": "oriel-synthetic-baseline",
+      "revision": 2
+    },
+    "generation": {
+      "max_output_tokens": 1024,
+      "strategy": "temperature-zero"
+    },
+    "method": "direct-openai-compatible-text-request",
+    "model": {
+      "id": "reference-local-qwen",
+      "revision": 1
+    },
+    "provenance": "captured_sanitized",
+    "resource_profile": "operator-managed-reference"
+  },
+  "schema_version": "1.0"
+}
