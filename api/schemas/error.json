@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/error.json",
+  "title": "Oriel 1.0 error envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "category", "message", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "category": {"enum": ["invalid_input", "conflict_or_expired_reference", "overload", "policy_denial", "dependency_unavailable", "timeout", "cancellation", "uncertainty", "internal_failure"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 256},
+        "retryable": {"type": "boolean"},
+        "request_id": {"$ref": "common.json#/$defs/opaque_id"},
+        "session_id": {"$ref": "common.json#/$defs/opaque_id"},
+        "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
+        "action_outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]}
+      }
+    }
+  }
+}

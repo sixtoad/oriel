@@ -1,0 +1,4 @@
+{
+  "fixture": "caps",
+  "limits": {"active_turns": 2, "context_bytes": 65536, "context_messages": 32, "event_data_bytes": 8192, "input_bytes": 16384, "model_deadline_seconds": 30, "open_sessions": 10, "queue_depth": 8, "streamed_content_bytes": 65536}
+}

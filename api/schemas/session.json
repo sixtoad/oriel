@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/session.json",
+  "title": "Oriel 1.0 session",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "context_generation"],
+  "properties": {
+    "session_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "context_generation": {"type": "integer", "minimum": 0}
+  }
+}

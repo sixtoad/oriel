@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/event.json",
+  "title": "Oriel 1.0 stream event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["type", "request_id", "session_id", "trace_id", "context_generation", "seq"],
+  "properties": {
+    "type": {"enum": ["accepted", "ack", "content_delta", "proposal", "validation", "action_state", "error", "terminal"]},
+    "request_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "session_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "context_generation": {"type": "integer", "minimum": 0},
+    "seq": {"type": "integer", "minimum": 1},
+    "content": {"type": "string", "maxLength": 65536},
+    "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]},
+    "error": {"$ref": "error.json#/properties/error"}
+  },
+  "allOf": [
+    {"if": {"properties": {"type": {"const": "content_delta"}}}, "then": {"required": ["content"]}},
+    {"if": {"properties": {"type": {"const": "error"}}}, "then": {"required": ["error"]}},
+    {"if": {"properties": {"type": {"const": "terminal"}}}, "then": {"required": ["outcome"]}},
+    {"if": {"properties": {"type": {"const": "ack"}}}, "then": {"not": {"required": ["outcome"]}}}
+  ]
+}

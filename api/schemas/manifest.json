@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/manifest.json",
+  "title": "Oriel 1.0 generic action manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "actions"],
+  "properties": {
+    "manifest_version": {"const": "1.0"},
+    "actions": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "target", "enabled", "dry_run", "idempotency", "deadline"], "properties": {"name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}, "target": {"type": "string", "pattern": "^synthetic:[a-z][a-z0-9_-]{0,63}$"}, "enabled": {"const": false}, "dry_run": {"type": "boolean"}, "idempotency": {"type": "string", "minLength": 1, "maxLength": 128}, "deadline": {"$ref": "common.json#/$defs/deadline"}}}}
+  }
+}

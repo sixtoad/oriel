@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/config.json",
+  "title": "Oriel 1.0 immutable configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "provider", "skills"],
+  "properties": {
+    "api_version": {"const": "1.0"},
+    "provider": {"type": "object", "additionalProperties": false, "required": ["connection_ref"], "properties": {"connection_ref": {"type": "string", "minLength": 1, "maxLength": 256}}},
+    "skills": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}, "connection_ref": {"type": "string", "minLength": 1, "maxLength": 256}}}}
+  }
+}

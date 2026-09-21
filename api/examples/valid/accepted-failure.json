@@ -1,0 +1,8 @@
+{
+  "events": [
+    {"context_generation": 0, "request_id": "req-fail", "seq": 1, "session_id": "ses-fail", "trace_id": "tr-fail", "type": "accepted"},
+    {"context_generation": 0, "error": {"category": "timeout", "code": "model_deadline", "message": "request could not complete", "request_id": "req-fail", "retryable": true, "session_id": "ses-fail", "trace_id": "tr-fail"}, "request_id": "req-fail", "seq": 2, "session_id": "ses-fail", "trace_id": "tr-fail", "type": "error"},
+    {"context_generation": 0, "outcome": "failed", "request_id": "req-fail", "seq": 3, "session_id": "ses-fail", "trace_id": "tr-fail", "type": "terminal"}
+  ],
+  "fixture": "accepted_failure"
+}

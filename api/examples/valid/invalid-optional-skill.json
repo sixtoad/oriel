@@ -1,0 +1,5 @@
+{
+  "config": {"api_version": "1.0", "provider": {"connection_ref": "local-provider"}, "skills": {"sample": {"enabled": false, "unknown": true}}},
+  "expected": {"disabled_skills": ["sample"]},
+  "fixture": "invalid_optional_skill"
+}
