@@ -6,8 +6,8 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from oriel.config import load_startup
-from oriel.http import HealthServer
+from oriel.adapters.configuration import load_startup
+from oriel.adapters.http import HealthServer
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'

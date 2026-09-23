@@ -1,5 +1,5 @@
 """Provider-neutral bootstrap core for Oriel."""
 
-from .core import TextGateway, TurnResult
+from .application.text_gateway import TextGateway, TurnResult
 
 __all__ = ["TextGateway", "TurnResult"]

@@ -4,7 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from oriel.config import DEFAULT_CONFIG_PATH, UNREADY_CODE, load_startup, parse_core_config, select_config_path
+from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, load_startup, select_config_path
+from oriel.application.startup import UNREADY_CODE
+from oriel.domain.configuration import parse_core_config
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -84,7 +86,7 @@ class StartupTests(unittest.TestCase):
             config.skills["new"] = {}  # type: ignore[index]
         with self.assertRaises(TypeError):
             config.skills["one"]["enabled"] = False  # type: ignore[index]
-        self.assertEqual(DEFAULT_CONFIG_PATH.parent.name, "oriel")
+        self.assertEqual(DEFAULT_CONFIG_PATH.parent.name, "adapters")
         self.assertTrue(DEFAULT_CONFIG_PATH.is_file())
 
 

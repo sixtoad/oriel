@@ -5,10 +5,11 @@ import argparse
 import json
 from http.client import HTTPConnection
 
-from .adapters import DisabledTools, FakeModel, FixedClock, NoopTelemetry, VolatileState
-from .config import API_VERSION, load_startup
-from .core import TextGateway
-from .http import HealthServer
+from .adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, VolatileState
+from .adapters.configuration import load_startup
+from .adapters.http import HealthServer
+from .application.text_gateway import TextGateway
+from .domain.configuration import API_VERSION
 
 
 def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:

@@ -5,7 +5,8 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
-from .config import API_VERSION, StartupState
+from ..application.startup import StartupState
+from ..domain.configuration import API_VERSION
 
 
 class _HealthHTTPServer(ThreadingHTTPServer):

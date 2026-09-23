@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import StartupState
-from .contracts import Clock, ModelPort, StatePort, TelemetryPort, ToolPort
+from .ports import Clock, ModelPort, StatePort, TelemetryPort, ToolPort
+from .startup import StartupState
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
 MAX_FAKE_TURN_OUTPUT_BYTES = 4096

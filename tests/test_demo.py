@@ -47,7 +47,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(json.loads(result.stdout)["fake_turn"]["text"], "The fake model is ready.")
 
     def test_demo_has_no_external_provider_or_home_assistant_dependency(self):
-        source = DEMO.read_text(encoding="utf-8") + (ROOT / "oriel" / "adapters.py").read_text(encoding="utf-8")
+        source = DEMO.read_text(encoding="utf-8") + (ROOT / "oriel" / "adapters" / "bootstrap.py").read_text(encoding="utf-8")
         self.assertNotIn("requests", source)
         self.assertNotIn("homeassistant", source.lower())
 

@@ -4,9 +4,10 @@ import ast
 from pathlib import Path
 import unittest
 
-from oriel.adapters import DisabledTools, ToolDenied, VolatileState
-from oriel.config import StartupState, parse_core_config
-from oriel.core import MAX_FAKE_TURN_OUTPUT_BYTES, TextGateway
+from oriel.adapters.bootstrap import DisabledTools, ToolDenied, VolatileState
+from oriel.application.startup import StartupState
+from oriel.application.text_gateway import MAX_FAKE_TURN_OUTPUT_BYTES, TextGateway
+from oriel.domain.configuration import parse_core_config
 
 
 class RecordingModel:
@@ -104,7 +105,7 @@ class CoreTests(unittest.TestCase):
             DisabledTools().dispatch("anything", {})
 
     def test_core_has_no_provider_or_home_assistant_import(self):
-        source = Path("oriel/core.py").read_text(encoding="utf-8")
+        source = Path("oriel/application/text_gateway.py").read_text(encoding="utf-8")
         modules = [node.module or "" for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ImportFrom)]
         self.assertTrue(all("homeassistant" not in module.lower() and "provider" not in module.lower() for module in modules))
 
