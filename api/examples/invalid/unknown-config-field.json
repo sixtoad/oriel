@@ -1,6 +1,17 @@
 {
-  "config": {"api_version": "1.0", "provider": {"connection_ref": "local-provider", "secret": "PRIVATE_PAYLOAD_MUST_NOT_APPEAR"}, "skills": {}},
+  "config": {
+    "api_version": "1.0",
+    "provider": {
+      "connection_ref": "local-provider",
+      "secret": "PRIVATE_PAYLOAD_MUST_NOT_APPEAR"
+    },
+    "skills": {}
+  },
   "fixture": "unknown_config_field",
   "selected_path": "explicit-config.json",
-  "sources": {"default": "packaged-default.json", "env": "environment-config.json", "explicit": "explicit-config.json"}
+  "sources": {
+    "default": "packaged-default.json",
+    "env": "environment-config.json",
+    "explicit": "explicit-config.json"
+  }
 }

@@ -46,6 +46,7 @@ class ApiContractTests(unittest.TestCase):
     def test_stream_fences_identity_ack_and_terminal_rules(self):
         valid = load_json(EXAMPLES / "valid" / "accepted-stream.json")["events"]
         mutations = [
+            (lambda e: e[0].pop("api_version"), "api_version"),
             (lambda e: e.__setitem__(0, dict(e[0], type="content_delta")), "first event"),
             (lambda e: e.append(dict(e[-1], seq=5, type="content_delta", content="late")), "after terminal"),
             (lambda e: e.__setitem__(1, dict(e[1], seq=1)), "strictly increasing"),

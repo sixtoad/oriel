@@ -1,6 +1,20 @@
 {
-  "config": {"api_version": "1.0", "provider": {"connection_ref": "local-provider"}, "skills": {"sample": {"enabled": false}}},
+  "config": {
+    "api_version": "1.0",
+    "provider": {
+      "connection_ref": "local-provider"
+    },
+    "skills": {
+      "sample": {
+        "enabled": false
+      }
+    }
+  },
   "fixture": "config_precedence",
   "selected_path": "explicit-config.json",
-  "sources": {"default": "packaged-default.json", "env": "environment-config.json", "explicit": "explicit-config.json"}
+  "sources": {
+    "default": "packaged-default.json",
+    "env": "environment-config.json",
+    "explicit": "explicit-config.json"
+  }
 }

@@ -4,13 +4,13 @@ This directory freezes the version `1.0` text boundary before a gateway runtime 
 
 ## Paths and failures
 
-The only paths are `POST /v1/sessions`, `POST /v1/sessions/{session_id}/turns`, `POST /v1/sessions/{session_id}/reset`, `DELETE /v1/sessions/{session_id}`, `POST /v1/requests/{request_id}/cancel`, and `GET /v1/requests/{request_id}`. IDs are opaque. A status lookup is passive: it never starts or replays work.
+The public work paths are `POST /v1/sessions`, `POST /v1/sessions/{session_id}/turns`, `POST /v1/sessions/{session_id}/reset`, `DELETE /v1/sessions/{session_id}`, `POST /v1/requests/{request_id}/cancel`, and `GET /v1/requests/{request_id}`. `GET /live` reports process liveness and `GET /ready` reports only ready or unready core state; neither starts work nor exposes configuration. IDs are opaque. A status lookup is passive: it never starts or replays work.
 
 Before acceptance, invalid input returns 400, a missing or expired reference 404, a conflict 409, and overload 429. Each body is the safe `error` envelope: stable `code`, `category`, bounded `message`, `retryable`, available correlation IDs, and optional `action_outcome` only. Categories are `invalid_input`, `conflict_or_expired_reference`, `overload`, `policy_denial`, `dependency_unavailable`, `timeout`, `cancellation`, `uncertainty`, and `internal_failure`. The first three categories map directly to the pre-accept HTTP cases; policy, dependency, timeout, cancellation, uncertainty, and internal failures after acceptance are typed stream errors followed by exactly one terminal event. `GET /v1/requests/{request_id}` returns only the passive `in_progress`, `terminal`, or `unavailable` status shape; it cannot initiate or replay work.
 
 ## Turn stream lifecycle
 
-`POST .../turns` is non-replayable. The first event is `accepted`. Each event has request, session, and trace IDs, a context generation, and a strictly increasing positive `seq`. Only `accepted`, `ack`, `content_delta`, `proposal`, `validation`, `action_state`, `error`, and `terminal` occur. `terminal` appears exactly once, last, with `completed`, `denied`, `failed`, `cancelled`, or `outcome_unknown`; no later event is valid.
+`POST .../turns` is non-replayable. The first event is `accepted`. Each event has `api_version`, request, session, and trace IDs, a context generation, and a strictly increasing positive `seq`. Only `accepted`, `ack`, `content_delta`, `proposal`, `validation`, `action_state`, `error`, and `terminal` occur. `terminal` appears exactly once, last, with `completed`, `denied`, `failed`, `cancelled`, or `outcome_unknown`; no later event is valid.
 
 `content_delta` always carries `content`; `error` always carries the safe error object; and `terminal` always carries `outcome`. `ack` is optional, nonterminal, at most once, before useful content, and has no outcome because it does not state approval or completion. Unknown event fields are permitted for stream evolution. Unknown fields in configuration, manifests, proposals, and action-result documents are rejected.
 

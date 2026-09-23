@@ -1,7 +1,24 @@
 {
   "events": [
-    {"context_generation": 0, "request_id": "req-cancel", "seq": 1, "session_id": "ses-cancel", "trace_id": "tr-cancel", "type": "accepted"},
-    {"context_generation": 0, "outcome": "cancelled", "request_id": "req-cancel", "seq": 2, "session_id": "ses-cancel", "trace_id": "tr-cancel", "type": "terminal"}
+    {
+      "api_version": "1.0",
+      "context_generation": 0,
+      "request_id": "req-cancel",
+      "seq": 1,
+      "session_id": "ses-cancel",
+      "trace_id": "tr-cancel",
+      "type": "accepted"
+    },
+    {
+      "api_version": "1.0",
+      "context_generation": 0,
+      "outcome": "cancelled",
+      "request_id": "req-cancel",
+      "seq": 2,
+      "session_id": "ses-cancel",
+      "trace_id": "tr-cancel",
+      "type": "terminal"
+    }
   ],
   "fixture": "cancelled_stream"
 }

@@ -146,8 +146,10 @@ def validate_stream(events, path="events"):
     streamed_content_bytes = 0
     for index, event in enumerate(events):
         loc = f"{path}[{index}]"
-        if not _keys(event, ("type", "request_id", "session_id", "trace_id", "context_generation", "seq"), loc, errors, allow_extra=True):
+        if not _keys(event, ("api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"), loc, errors, allow_extra=True):
             continue
+        if event["api_version"] != "1.0":
+            errors.append(loc + ".api_version: expected 1.0")
         kind = event["type"]
         if kind not in EVENTS:
             errors.append(loc + ".type: unsupported event")

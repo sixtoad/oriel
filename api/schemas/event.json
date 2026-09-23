@@ -4,8 +4,9 @@
   "title": "Oriel 1.0 stream event",
   "type": "object",
   "additionalProperties": true,
-  "required": ["type", "request_id", "session_id", "trace_id", "context_generation", "seq"],
+  "required": ["api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"],
   "properties": {
+    "api_version": {"const": "1.0"},
     "type": {"enum": ["accepted", "ack", "content_delta", "proposal", "validation", "action_state", "error", "terminal"]},
     "request_id": {"$ref": "common.json#/$defs/opaque_id"},
     "session_id": {"$ref": "common.json#/$defs/opaque_id"},

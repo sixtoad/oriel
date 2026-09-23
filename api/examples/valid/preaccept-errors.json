@@ -1,9 +1,49 @@
 {
   "fixture": "preaccept_errors",
   "responses": [
-    {"body": {"error": {"category": "invalid_input", "code": "invalid_json", "message": "request is invalid", "retryable": false}}, "status": 400},
-    {"body": {"error": {"category": "conflict_or_expired_reference", "code": "session_missing", "message": "reference is unavailable", "retryable": false}}, "status": 404},
-    {"body": {"error": {"category": "conflict_or_expired_reference", "code": "turn_active", "message": "request conflicts with current state", "retryable": true}}, "status": 409},
-    {"body": {"error": {"category": "overload", "code": "queue_full", "message": "service is busy", "retryable": true}}, "status": 429}
+    {
+      "body": {
+        "error": {
+          "category": "invalid_input",
+          "code": "invalid_json",
+          "message": "request is invalid",
+          "retryable": false
+        }
+      },
+      "status": 400
+    },
+    {
+      "body": {
+        "error": {
+          "category": "conflict_or_expired_reference",
+          "code": "session_missing",
+          "message": "reference is unavailable",
+          "retryable": false
+        }
+      },
+      "status": 404
+    },
+    {
+      "body": {
+        "error": {
+          "category": "conflict_or_expired_reference",
+          "code": "turn_active",
+          "message": "request conflicts with current state",
+          "retryable": true
+        }
+      },
+      "status": 409
+    },
+    {
+      "body": {
+        "error": {
+          "category": "overload",
+          "code": "queue_full",
+          "message": "service is busy",
+          "retryable": true
+        }
+      },
+      "status": 429
+    }
   ]
 }

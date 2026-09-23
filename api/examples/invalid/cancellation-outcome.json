@@ -1,6 +1,10 @@
 {
   "acknowledgements": [
-    {"outcome": "cancelled", "request_id": "req-live", "state": "cancellation_requested"}
+    {
+      "outcome": "cancelled",
+      "request_id": "req-live",
+      "state": "cancellation_requested"
+    }
   ],
   "fixture": "cancellation_outcome"
 }

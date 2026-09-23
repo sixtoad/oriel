@@ -4,6 +4,15 @@ info:
   version: '1.0'
   description: Versioned text-only boundary. JSON is application/json; accepted turns use text/event-stream.
 paths:
+  /live:
+    get:
+      responses:
+        '200': {description: Process liveness, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+  /ready:
+    get:
+      responses:
+        '200': {description: Core configuration is ready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+        '503': {description: Core configuration is unready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
   /v1/sessions:
     post:
       responses:
