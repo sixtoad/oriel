@@ -52,3 +52,30 @@ It prints stable JSON for `/live`, `/ready`, and an internal fake-model text
 turn. It uses the packaged non-secret fixture, makes no provider or Home
 Assistant call, and stores nothing persistently. It is not a public turn API,
 a gateway stream, an Ingress result, or a model-provider integration.
+
+## Mutation testing
+
+Mutation testing checks whether the focused gateway tests reject small changes
+to the shipped `oriel/` package. It is a development-only check and does not
+add a runtime dependency. It requires Python 3.12 or later, `uv`, and a
+POSIX-capable environment (Linux or WSL). Set up the pinned tool version and
+run the baseline with bounded parallelism:
+
+```sh
+uv sync --group dev
+uv run --group dev mutmut run --max-children 4
+```
+
+Inspect the reproducible text result and browse individual mutations with:
+
+```sh
+uv run --group dev mutmut results
+uv run --group dev mutmut browse
+```
+
+`mutmut` stores resumable results in the ignored `mutants/` directory. Remove
+that directory before a fully fresh run; it automatically reruns when
+`pyproject.toml` or `uv.lock` changes. The runner uses POSIX process forking;
+use a Linux environment or WSL. Review survivors and timeouts from `results`
+before treating a run as a baseline. Oriel has no mutation-score threshold or
+CI gate until that review is complete.
