@@ -38,3 +38,17 @@ evidence is retained, that criterion remains incomplete.
 A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
 replays a real existing local-Qwen backend measurement. It is deliberately
 limited to the text backend and does not represent full Assist or voice evidence.
+
+## Text-core bootstrap
+
+The dependency-free bootstrap has a health-only server and a deterministic fake
+model exercise. From a clean checkout with Python 3.12, run:
+
+```sh
+python3 scripts/demo_text_gateway.py --self-test
+```
+
+It prints stable JSON for `/live`, `/ready`, and an internal fake-model text
+turn. It uses the packaged non-secret fixture, makes no provider or Home
+Assistant call, and stores nothing persistently. It is not a public turn API,
+a gateway stream, an Ingress result, or a model-provider integration.
