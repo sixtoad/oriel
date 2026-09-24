@@ -5,7 +5,7 @@ import argparse
 import json
 from http.client import HTTPConnection
 
-from .adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, VolatileState
+from .adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
 from .adapters.configuration import load_startup
 from .adapters.http import HealthServer
 from .application.text_gateway import TextGateway
@@ -26,7 +26,8 @@ def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
     startup = load_startup(config_path)
-    server = HealthServer(startup)
+    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+    server = HealthServer(startup, core)
     server.start()
     try:
         live_status, live = _get_health(server, "/live")
@@ -35,7 +36,6 @@ def run_self_test(config_path: str | None = None) -> dict[str, object]:
         server.close()
     if live_status != 200 or ready_status != 200 or not startup.ready:
         raise RuntimeError("self-test requires valid configuration")
-    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools())
     turn = core.run_fake_turn("self-test", startup)
     return {"api_version": API_VERSION, "fake_turn": {"text": turn.text}, "live": live, "ready": ready}
 
@@ -50,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
-    server = HealthServer(load_startup(args.config), args.host, args.port)
+    startup = load_startup(args.config)
+    gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
+    server = HealthServer(startup, gateway, args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

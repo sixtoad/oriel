@@ -4,7 +4,7 @@ import ast
 from pathlib import Path
 import unittest
 
-from oriel.adapters.bootstrap import DisabledTools, ToolDenied, VolatileState
+from oriel.adapters.bootstrap import DisabledTools, SequentialIds, ThreadSafeSynchronization, ToolDenied, VolatileState
 from oriel.application.startup import StartupState
 from oriel.application.text_gateway import MAX_FAKE_TURN_OUTPUT_BYTES, TextGateway
 from oriel.domain.configuration import parse_core_config
@@ -67,7 +67,7 @@ class CoreTests(unittest.TestCase):
         state = RecordingState()
         telemetry = RecordingTelemetry()
         tools = RecordingTools()
-        core = TextGateway(model, clock, state, telemetry, tools)
+        core = TextGateway(model, clock, state, telemetry, tools, SequentialIds(), ThreadSafeSynchronization())
 
         self.assertEqual(core.run_fake_turn("hello", self.ready()).text, "model output")
         self.assertEqual(model.inputs, ["hello"])
@@ -76,7 +76,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(tools.dispatched)
 
     def test_turn_is_bounded(self):
-        core = TextGateway(RecordingModel(), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools())
+        core = TextGateway(RecordingModel(), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools(), SequentialIds(), ThreadSafeSynchronization())
         with self.assertRaises(ValueError):
             core.run_fake_turn("", self.ready())
         with self.assertRaises(ValueError):
@@ -84,14 +84,14 @@ class CoreTests(unittest.TestCase):
 
     def test_turn_rejects_unready_startup_invalid_utf8_and_bad_model_output(self):
         unready = StartupState(None, "config_unavailable")
-        core = TextGateway(RecordingModel(), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools())
+        core = TextGateway(RecordingModel(), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools(), SequentialIds(), ThreadSafeSynchronization())
         with self.assertRaises(RuntimeError):
             core.run_fake_turn("hello", unready)
         with self.assertRaises(ValueError):
             core.run_fake_turn("\ud800", self.ready())
         for output in ("\ud800", "x" * (MAX_FAKE_TURN_OUTPUT_BYTES + 1), "", 1):
             with self.subTest(output=repr(output)):
-                rejecting_core = TextGateway(OutputModel(output), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools())
+                rejecting_core = TextGateway(OutputModel(output), RecordingClock(), RecordingState(), RecordingTelemetry(), RecordingTools(), SequentialIds(), ThreadSafeSynchronization())
                 with self.assertRaises(ValueError):
                     rejecting_core.run_fake_turn("hello", self.ready())
 

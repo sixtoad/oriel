@@ -114,11 +114,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                     path,
                 )
 
-    def test_health_adapter_does_not_own_gateway_or_tool_policy(self):
+    def test_http_adapter_only_translates_gateway_operations(self):
         imported = imported_modules(PACKAGE / "adapters" / "http.py")
-        self.assertEqual(imported & {"oriel.application.text_gateway", "oriel.application.ports"}, set())
+        self.assertEqual(imported & {"oriel.application.text_gateway"}, {"oriel.application.text_gateway"})
+        self.assertEqual(imported & {"oriel.application.ports"}, set())
         self.assertEqual(imported & {"oriel.application.startup"}, {"oriel.application.startup"})
         self.assertEqual(imported & {"oriel.domain.configuration"}, {"oriel.domain.configuration"})
         source = (PACKAGE / "adapters" / "http.py").read_text(encoding="utf-8")
-        for prohibited in ("TextGateway", "ToolPort", "StatePort", "ModelPort", "dispatch(", "record_turn(", "load_startup("):
+        for prohibited in ("ModelPort", "ToolPort", "StatePort", "dispatch(", "record_turn(", "load_startup(", "_sessions", "_requests", "next_id("):
             self.assertNotIn(prohibited, source)

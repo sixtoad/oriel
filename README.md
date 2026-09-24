@@ -41,17 +41,29 @@ limited to the text backend and does not represent full Assist or voice evidence
 
 ## Text-core bootstrap
 
-The dependency-free bootstrap has a health-only server and a deterministic fake
-model exercise. From a clean checkout with Python 3.12, run:
+The dependency-free bootstrap has health endpoints, volatile sessions, ordered
+SSE turns, passive request status, and a deterministic fake model. From a clean
+checkout with Python 3.12, run:
 
 ```sh
 python3 scripts/demo_text_gateway.py --self-test
 ```
 
 It prints stable JSON for `/live`, `/ready`, and an internal fake-model text
-turn. It uses the packaged non-secret fixture, makes no provider or Home
-Assistant call, and stores nothing persistently. It is not a public turn API,
-a gateway stream, an Ingress result, or a model-provider integration.
+turn. To exercise the public stream locally, start `python3 -m oriel`, then in
+another terminal create a session and submit a turn:
+
+```sh
+curl -s -X POST http://127.0.0.1:8080/v1/sessions
+curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
+  -H 'content-type: application/json' --data '{"input":"hello"}'
+curl -s http://127.0.0.1:8080/v1/requests/<request_id>
+```
+
+The stream starts with `accepted`, emits ordered `content_delta` events, and
+ends with one `terminal` event. Status lookup is passive and never replays a
+turn. The bootstrap uses the packaged non-secret fixture, makes no provider or
+Home Assistant call, and stores nothing persistently.
 
 ## Mutation testing
 
