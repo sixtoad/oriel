@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/common.json",
+  "$defs": {
+    "opaque_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._~-]+$"},
+    "message": {"type": "object", "additionalProperties": false, "required": ["role", "content"], "properties": {"role": {"enum": ["user", "assistant"]}, "content": {"type": "string", "maxLength": 16384}}},
+    "deadline": {"type": "string", "format": "date-time"}
+  }
+}

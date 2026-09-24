@@ -1,0 +1,10 @@
+{
+  "fixture": "passive_status_outcome",
+  "statuses": [
+    {
+      "outcome": "completed",
+      "request_id": "req-progress",
+      "state": "in_progress"
+    }
+  ]
+}

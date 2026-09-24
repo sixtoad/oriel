@@ -1,0 +1,34 @@
+{
+  "fixture": "generic_action",
+  "manifest": {
+    "actions": [
+      {
+        "deadline": "2030-01-02T12:34:00Z",
+        "dry_run": true,
+        "enabled": false,
+        "idempotency": "idem-1",
+        "name": "sample_action",
+        "target": "synthetic:sample-target"
+      }
+    ],
+    "manifest_version": "1.0"
+  },
+  "proposal": {
+    "action": "sample_action",
+    "arguments": {
+      "values": [
+        "sample"
+      ]
+    },
+    "confirmation": {
+      "evidence": null,
+      "required": true
+    },
+    "deadline": "2030-01-02T12:34:00Z",
+    "dry_run": true,
+    "idempotency": "idem-1",
+    "proposal_id": "proposal-1",
+    "proposal_version": "1.0",
+    "target": "synthetic:sample-target"
+  }
+}

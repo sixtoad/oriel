@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/health.json",
+  "title": "Oriel operational health",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "state"],
+  "properties": {
+    "api_version": {"const": "1.0"},
+    "state": {"enum": ["live", "ready", "unready"]},
+    "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+  }
+}

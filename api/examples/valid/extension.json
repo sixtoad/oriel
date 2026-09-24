@@ -1,0 +1,25 @@
+{
+  "events": [
+    {
+      "api_version": "1.0",
+      "context_generation": 1,
+      "future_hint": "optional",
+      "request_id": "req-2",
+      "seq": 1,
+      "session_id": "ses-2",
+      "trace_id": "tr-2",
+      "type": "accepted"
+    },
+    {
+      "api_version": "1.0",
+      "context_generation": 1,
+      "outcome": "denied",
+      "request_id": "req-2",
+      "seq": 2,
+      "session_id": "ses-2",
+      "trace_id": "tr-2",
+      "type": "terminal"
+    }
+  ],
+  "fixture": "extension_event"
+}

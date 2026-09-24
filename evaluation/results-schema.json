@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Oriel offline measurement result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "provenance", "corpus", "component", "model", "generation", "conditions", "resource_profile", "method", "samples"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "provenance": {"enum": ["synthetic", "captured_sanitized"]},
+    "corpus": {"$ref": "#/$defs/revisioned"},
+    "component": {"$ref": "#/$defs/revisioned"},
+    "model": {"$ref": "#/$defs/revisioned"},
+    "generation": {"type": "object", "additionalProperties": false, "required": ["strategy", "max_output_tokens"], "properties": {"strategy": {"$ref": "#/$defs/id"}, "max_output_tokens": {"type": "integer", "minimum": 1}}},
+    "conditions": {"type": "object", "additionalProperties": false, "required": ["load"], "properties": {"load": {"$ref": "#/$defs/id"}}},
+    "resource_profile": {"$ref": "#/$defs/id"},
+    "method": {"$ref": "#/$defs/id"},
+    "samples": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sample"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
+    "reason_id": {"type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
+    "revisioned": {"type": "object", "additionalProperties": false, "required": ["id", "revision"], "properties": {"id": {"$ref": "#/$defs/id"}, "revision": {"type": "integer", "minimum": 1}}},
+    "stage": {"oneOf": [
+      {"type": "object", "additionalProperties": false, "required": ["observed_monotonic_ms"], "properties": {"observed_monotonic_ms": {"type": "number"}}},
+      {"type": "object", "additionalProperties": false, "required": ["unavailable_reason"], "properties": {"unavailable_reason": {"$ref": "#/$defs/reason_id"}}},
+      {"type": "object", "additionalProperties": false, "required": ["uncertainty"], "properties": {"uncertainty": {"$ref": "#/$defs/reason_id"}}}
+    ]},
+    "sample": {"type": "object", "additionalProperties": false, "required": ["sample_id", "case", "population", "thermal", "terminal", "assessment", "anchor_monotonic_ms", "stages"], "properties": {
+      "sample_id": {"$ref": "#/$defs/id"}, "case": {"$ref": "#/$defs/revisioned"},
+      "population": {"enum": ["text", "voice"]}, "thermal": {"enum": ["cold", "warm"]},
+      "terminal": {"enum": ["success", "failure", "deferred", "unsupported"]},
+      "assessment": {"type": "object", "additionalProperties": false, "required": ["expected_correct", "observed_correct", "side_effect_outcome"], "properties": {"expected_correct": {"type": ["boolean", "null"]}, "observed_correct": {"type": ["boolean", "null"]}, "side_effect_outcome": {"enum": ["none", "expected", "unexpected", "not_assessable"]}}},
+      "anchor_monotonic_ms": {"type": "number"},
+      "stages": {"type": "object", "additionalProperties": false, "required": ["wake", "end_of_turn", "final_transcript", "route", "first_model_token", "first_useful_content", "acknowledgement", "first_audio", "static_validation", "action_completion", "final_audio"], "properties": {
+        "wake": {"$ref": "#/$defs/stage"}, "end_of_turn": {"$ref": "#/$defs/stage"}, "final_transcript": {"$ref": "#/$defs/stage"}, "route": {"$ref": "#/$defs/stage"}, "first_model_token": {"$ref": "#/$defs/stage"}, "first_useful_content": {"$ref": "#/$defs/stage"}, "acknowledgement": {"$ref": "#/$defs/stage"}, "first_audio": {"$ref": "#/$defs/stage"}, "static_validation": {"$ref": "#/$defs/stage"}, "action_completion": {"$ref": "#/$defs/stage"}, "final_audio": {"$ref": "#/$defs/stage"}
+      }}
+    }}
+  }
+}

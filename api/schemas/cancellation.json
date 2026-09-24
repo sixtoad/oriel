@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/cancellation.json",
+  "title": "Oriel 1.0 cancellation acknowledgement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "state"],
+  "properties": {
+    "request_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "state": {"enum": ["cancellation_requested", "already_terminal"]},
+    "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]}
+  },
+  "allOf": [
+    {"if": {"properties": {"state": {"const": "already_terminal"}}}, "then": {"required": ["outcome"]}},
+    {"if": {"properties": {"state": {"const": "cancellation_requested"}}}, "then": {"not": {"required": ["outcome"]}}}
+  ]
+}

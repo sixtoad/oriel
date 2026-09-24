@@ -1,0 +1,17 @@
+{
+  "fixture": "unknown_manifest_field",
+  "manifest": {
+    "actions": [
+      {
+        "deadline": "2030-01-02T12:34:00Z",
+        "dry_run": true,
+        "enabled": false,
+        "idempotency": "idem-1",
+        "name": "sample_action",
+        "target": "synthetic:sample-target",
+        "unknown": true
+      }
+    ],
+    "manifest_version": "1.0"
+  }
+}
