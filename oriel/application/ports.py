@@ -28,10 +28,25 @@ class ModelOutcome:
 ModelStreamItem = ModelChunk | ModelOutcome
 
 
+@dataclass(frozen=True)
+class ModelMessage:
+    """One attributed conversation message supplied to a model adapter."""
+
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
+class ModelInput:
+    """The complete bounded transcript for one isolated model turn."""
+
+    messages: tuple[ModelMessage, ...]
+
+
 class StreamingModelPort(Protocol):
     """Produces bounded text pieces and one explicit outcome for an admitted turn."""
 
-    def stream(self, text: str) -> Iterable[ModelStreamItem]: ...
+    def stream(self, input: ModelInput) -> Iterable[ModelStreamItem]: ...
 
 
 class IdentifierPort(Protocol):
@@ -50,6 +65,12 @@ class Clock(Protocol):
     """Supplies an opaque timestamp for local state and telemetry."""
 
     def now(self) -> str: ...
+
+
+class MonotonicClock(Protocol):
+    """Supplies monotonic seconds for volatile lifecycle decisions."""
+
+    def monotonic(self) -> float: ...
 
 
 class StatePort(Protocol):

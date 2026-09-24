@@ -284,6 +284,26 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(terminal["outcome"], "completed")
         self.assertEqual(model.calls, 1)
 
+    def test_reset_and_end_routes_only_translate_lifecycle_outcomes(self):
+        server = self.with_server(FakeModel())
+        session = self.create_session(server)
+        connection = self.connection(server)
+        try:
+            connection.request("POST", f"/v1/sessions/{session['session_id']}/reset")
+            reset = connection.getresponse()
+            self.assertEqual(reset.status, 200)
+            self.assertEqual(json.loads(reset.read()), {"session_id": session["session_id"], "context_generation": 1})
+            connection.request("DELETE", f"/v1/sessions/{session['session_id']}")
+            deleted = connection.getresponse()
+            self.assertEqual(deleted.status, 204)
+            self.assertEqual(deleted.read(), b"")
+            connection.request("POST", f"/v1/sessions/{session['session_id']}/turns", body=b'{"input":"again"}', headers={"Content-Type": "application/json"})
+            unavailable = connection.getresponse()
+            self.assertEqual(unavailable.status, 404)
+            self.assertEqual(json.loads(unavailable.read())["error"]["category"], "conflict_or_expired_reference")
+        finally:
+            connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

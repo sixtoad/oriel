@@ -1,20 +1,10 @@
-"""Application-owned text turns, ordering, and volatile request status."""
+"""Application-owned text turns, volatile transcripts, and lifecycle fences."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Mapping
 
-from .ports import (
-    Clock,
-    IdentifierPort,
-    ModelChunk,
-    ModelOutcome,
-    ModelPort,
-    StatePort,
-    SynchronizationPort,
-    TelemetryPort,
-    ToolPort,
-)
+from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
 
@@ -27,19 +17,17 @@ MAX_STREAM_CONTENT_BYTES = 64 * 1024
 MAX_STREAM_EVENT_CONTENT_BYTES = 7 * 1024
 MAX_OPEN_SESSIONS = 10
 MAX_ACTIVE_TURNS = 2
+IDLE_SESSION_SECONDS = 30 * 60
+MAX_SESSION_SECONDS = 24 * 60 * 60
 
 
 @dataclass(frozen=True)
 class TurnResult:
-    """The bounded result used only by the local fake-model exercise."""
-
     text: str
 
 
 @dataclass(frozen=True)
 class AdmissionError(Exception):
-    """A typed, safe pre-accept failure for an HTTP adapter to map."""
-
     status: int
     code: str
     category: str
@@ -49,8 +37,6 @@ class AdmissionError(Exception):
 
 @dataclass(frozen=True)
 class StreamEvent:
-    """A public event whose order and terminal fence belong to the application."""
-
     type: str
     request_id: str
     session_id: str
@@ -62,15 +48,7 @@ class StreamEvent:
     outcome: str | None = None
 
     def payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "api_version": API_VERSION,
-            "type": self.type,
-            "request_id": self.request_id,
-            "session_id": self.session_id,
-            "trace_id": self.trace_id,
-            "context_generation": self.context_generation,
-            "seq": self.seq,
-        }
+        payload: dict[str, object] = {"api_version": API_VERSION, "type": self.type, "request_id": self.request_id, "session_id": self.session_id, "trace_id": self.trace_id, "context_generation": self.context_generation, "seq": self.seq}
         if self.content is not None:
             payload["content"] = self.content
         if self.error is not None:
@@ -80,10 +58,15 @@ class StreamEvent:
         return payload
 
 
-@dataclass(frozen=True)
+@dataclass
 class Session:
+    """Private volatile session state; payloads disclose only correlation data."""
+
     session_id: str
     context_generation: int = 0
+    transcript: tuple[ModelMessage, ...] = ()
+    created_at: float = 0.0
+    last_active_at: float = 0.0
 
     def payload(self) -> dict[str, object]:
         return {"session_id": self.session_id, "context_generation": self.context_generation}
@@ -101,18 +84,9 @@ class _Request:
 
 
 class TextGateway:
-    """Composition boundary for provider-neutral ports."""
+    """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(
-        self,
-        model: ModelPort,
-        clock: Clock,
-        state: StatePort,
-        telemetry: TelemetryPort,
-        tools: ToolPort,
-        identifiers: IdentifierPort,
-        synchronization: SynchronizationPort,
-    ) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -124,7 +98,6 @@ class TextGateway:
         self._requests: dict[str, _Request] = {}
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
-        """Run a ready-gated limited internal turn; it never dispatches a tool."""
         if not startup.ready:
             raise RuntimeError("fake turn is unavailable while unready")
         input_bytes = _utf8_length(text)
@@ -134,24 +107,24 @@ class TextGateway:
         output_bytes = _utf8_length(output)
         if output_bytes is None or not output or output_bytes > MAX_FAKE_TURN_OUTPUT_BYTES:
             raise ValueError("model returned invalid text")
-        occurred_at = self._clock.now()
-        self._state.record_turn(text, output, occurred_at)
+        self._state.record_turn(text, output, self._clock.now())
         self._telemetry.emit("fake_turn_completed", {"input_bytes": str(input_bytes)})
         return TurnResult(text=output)
 
     def create_session(self) -> Session:
-        """Create the small volatile handle needed by the initial turn route."""
         with self._synchronization.locked():
+            self._expire_sessions_locked()
             if len(self._sessions) >= MAX_OPEN_SESSIONS:
                 raise AdmissionError(429, "session_limit", "overload", "Session capacity is reached.", True)
-            session = Session(self._identifiers.next_id("session"))
+            now = self._monotonic()
+            session = Session(self._identifiers.next_id("session"), created_at=now, last_active_at=now)
             self._sessions[session.session_id] = session
             return session
 
     def begin_turn(self, session_id: str, document: object, startup: StartupState) -> Iterable[StreamEvent]:
-        """Admit a non-replayable turn before the returned stream invokes the model."""
-        text = _validate_turn_document(document)
+        text, supplied_context = _validate_turn_document(document)
         with self._synchronization.locked():
+            self._expire_sessions_locked()
             session = self._sessions.get(session_id)
             if session is None:
                 raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
@@ -161,34 +134,55 @@ class TextGateway:
                 raise AdmissionError(409, "turn_conflict", "conflict_or_expired_reference", "A turn is already active for this session.", True)
             if sum(request.outcome is None for request in self._requests.values()) >= MAX_ACTIVE_TURNS:
                 raise AdmissionError(429, "turn_capacity", "overload", "Turn capacity is reached.", True)
-            request = _Request(
-                request_id=self._identifiers.next_id("request"),
-                session_id=session.session_id,
-                trace_id=self._identifiers.next_id("trace"),
-                context_generation=session.context_generation,
-            )
+            if supplied_context and session.transcript:
+                raise AdmissionError(409, "context_conflict", "conflict_or_expired_reference", "Session context is already established.")
+            model_input = ModelInput((*(session.transcript or supplied_context), ModelMessage("user", text)))
+            _validate_transcript_capacity(model_input.messages)
+            session.last_active_at = self._monotonic()
+            request = _Request(self._identifiers.next_id("request"), session.session_id, self._identifiers.next_id("trace"), session.context_generation)
             self._requests[request.request_id] = request
-        return self._stream(request, text)
+        return self._stream(request, model_input, text, supplied_context)
+
+    def reset_session(self, session_id: str) -> Session:
+        with self._synchronization.locked():
+            self._expire_sessions_locked()
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
+            self._cancel_generation_locked(session_id, session.context_generation)
+            session.context_generation += 1
+            session.transcript = ()
+            session.last_active_at = self._monotonic()
+            return session
+
+    def end_session(self, session_id: str) -> None:
+        with self._synchronization.locked():
+            self._expire_sessions_locked()
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
+            self._cancel_generation_locked(session_id, session.context_generation)
+            del self._sessions[session_id]
+
+    def expire_sessions(self) -> None:
+        with self._synchronization.locked():
+            self._expire_sessions_locked()
 
     def request_status(self, request_id: str) -> dict[str, object]:
-        """Read retained status without dispatching, replaying, or mutating a turn."""
         with self._synchronization.locked():
             request = self._requests.get(request_id)
             if request is None:
                 return {"request_id": request_id, "state": "unavailable"}
-            payload: dict[str, object] = {
-                "request_id": request.request_id,
-                "session_id": request.session_id,
-                "trace_id": request.trace_id,
-                "context_generation": request.context_generation,
-                "state": "terminal" if request.outcome is not None else "in_progress",
-            }
+            payload: dict[str, object] = {"request_id": request.request_id, "session_id": request.session_id, "trace_id": request.trace_id, "context_generation": request.context_generation, "state": "terminal" if request.outcome is not None else "in_progress"}
             if request.outcome is not None:
                 payload["outcome"] = request.outcome
             return payload
 
-    def _stream(self, request: _Request, text: str) -> Iterator[StreamEvent]:
+    def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...]) -> Iterator[StreamEvent]:
         yield self._event(request, "accepted")
+        if self._is_fenced(request):
+            yield self._terminal(request, "cancelled")
+            return
         try:
             model = self._model
             if not hasattr(model, "stream"):
@@ -197,7 +191,16 @@ class TextGateway:
                 return
             saw_outcome = False
             streamed_bytes = 0
-            for item in model.stream(text):  # type: ignore[union-attr]
+            response_parts: list[str] = []
+            provider_stream = iter(model.stream(model_input))  # type: ignore[union-attr]
+            while True:
+                if self._is_fenced(request):
+                    yield self._terminal(request, "cancelled")
+                    return
+                try:
+                    item = next(provider_stream)
+                except StopIteration:
+                    break
                 if isinstance(item, ModelChunk):
                     byte_count = _utf8_length(item.content)
                     if byte_count is None or byte_count == 0 or byte_count > MAX_STREAM_EVENT_CONTENT_BYTES or streamed_bytes + byte_count > MAX_STREAM_CONTENT_BYTES:
@@ -205,7 +208,12 @@ class TextGateway:
                         yield self._terminal(request, "failed")
                         return
                     streamed_bytes += byte_count
-                    yield self._event(request, "content_delta", content=item.content)
+                    delta = self._content_delta(request, item.content)
+                    if delta is None:
+                        yield self._terminal(request, "cancelled")
+                        return
+                    response_parts.append(item.content)
+                    yield delta
                 elif isinstance(item, ModelOutcome):
                     if saw_outcome:
                         yield self._error(request, "invalid_outcome", "uncertainty", "Model outcome is unavailable.", False)
@@ -219,7 +227,17 @@ class TextGateway:
                     if item.outcome != "completed":
                         category = {"denied": "policy_denial", "failed": "internal_failure", "outcome_unknown": "uncertainty"}[item.outcome]
                         yield self._error(request, f"model_{item.outcome}", category, "Model did not complete the turn.", item.outcome == "failed")
-                    yield self._terminal(request, item.outcome)
+                        yield self._terminal(request, item.outcome)
+                        return
+                    record_result = self._record_completed_turn(request, text, supplied_context, "".join(response_parts))
+                    if record_result == "fenced":
+                        yield self._terminal(request, "cancelled")
+                        return
+                    if record_result == "limit":
+                        yield self._error(request, "transcript_limit", "internal_failure", "Response exceeded a context limit.", False)
+                        yield self._terminal(request, "failed")
+                        return
+                    yield self._terminal(request, "completed")
                     return
                 else:
                     yield self._error(request, "invalid_stream", "uncertainty", "Model output is unavailable.", False)
@@ -243,9 +261,65 @@ class TextGateway:
         with self._synchronization.locked():
             if request.terminal_emitted:
                 raise RuntimeError("terminal event already emitted")
+            session = self._sessions.get(request.session_id)
+            if request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
+                outcome = "cancelled"
             request.terminal_emitted = True
             request.outcome = outcome
             return self._event(request, "terminal", outcome=outcome)
+
+    def _content_delta(self, request: _Request, content: str) -> StreamEvent | None:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return None
+            return self._event(request, "content_delta", content=content)
+
+    def _record_completed_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str) -> str:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return "fenced"
+            session = self._sessions[request.session_id]
+            updated = (*(session.transcript or supplied_context), ModelMessage("user", text), ModelMessage("assistant", response))
+            try:
+                _validate_transcript_capacity(updated)
+            except AdmissionError:
+                return "limit"
+            session.transcript = updated
+            session.last_active_at = self._monotonic()
+            return "recorded"
+
+    def _is_fenced(self, request: _Request) -> bool:
+        with self._synchronization.locked():
+            return self._is_fenced_locked(request)
+
+    def _is_fenced_locked(self, request: _Request) -> bool:
+        session = self._sessions.get(request.session_id)
+        return request.outcome == "cancelled" or session is None or session.context_generation != request.context_generation
+
+    def _expire_sessions_locked(self) -> None:
+        now = self._monotonic()
+        expired = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if now - session.created_at >= MAX_SESSION_SECONDS
+            or (not self._generation_active_locked(session_id, session.context_generation) and now - session.last_active_at >= IDLE_SESSION_SECONDS)
+        ]
+        for session_id in expired:
+            self._cancel_generation_locked(session_id, self._sessions[session_id].context_generation)
+            del self._sessions[session_id]
+
+    def _generation_active_locked(self, session_id: str, generation: int) -> bool:
+        return any(request.session_id == session_id and request.context_generation == generation and request.outcome is None for request in self._requests.values())
+
+    def _cancel_generation_locked(self, session_id: str, generation: int) -> None:
+        for request in self._requests.values():
+            if request.session_id == session_id and request.context_generation == generation and request.outcome is None:
+                request.outcome = "cancelled"
+
+    def _monotonic(self) -> float:
+        if not hasattr(self._clock, "monotonic"):
+            raise RuntimeError("monotonic clock is unavailable")
+        return float(self._clock.monotonic())  # type: ignore[union-attr]
 
 
 def _utf8_length(value: object) -> int | None:
@@ -257,7 +331,7 @@ def _utf8_length(value: object) -> int | None:
         return None
 
 
-def _validate_turn_document(document: object) -> str:
+def _validate_turn_document(document: object) -> tuple[str, tuple[ModelMessage, ...]]:
     if not isinstance(document, dict) or set(document) - {"input", "context"} or "input" not in document:
         raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn input is invalid.")
     text = document["input"]
@@ -265,9 +339,9 @@ def _validate_turn_document(document: object) -> str:
     if not isinstance(text, str) or not text or input_bytes is None or input_bytes > MAX_TURN_INPUT_BYTES:
         raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn input is invalid.")
     context = document.get("context", [])
-    if not isinstance(context, list) or len(context) > MAX_CONTEXT_MESSAGES:
+    if not isinstance(context, list):
         raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn context is invalid.")
-    context_bytes = 0
+    messages: list[ModelMessage] = []
     for message in context:
         if not isinstance(message, dict) or set(message) != {"role", "content"} or message.get("role") not in {"user", "assistant"}:
             raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn context is invalid.")
@@ -275,7 +349,12 @@ def _validate_turn_document(document: object) -> str:
         size = _utf8_length(content)
         if not isinstance(content, str) or size is None or size > MAX_TURN_INPUT_BYTES:
             raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn context is invalid.")
-        context_bytes += size
-    if context_bytes > MAX_CONTEXT_BYTES:
-        raise AdmissionError(400, "invalid_turn", "invalid_input", "Turn context is invalid.")
-    return text
+        messages.append(ModelMessage(message["role"], content))
+    _validate_transcript_capacity(messages)
+    return text, tuple(messages)
+
+
+def _validate_transcript_capacity(messages: Iterable[ModelMessage]) -> None:
+    materialized = tuple(messages)
+    if len(materialized) > MAX_CONTEXT_MESSAGES or sum(_utf8_length(message.content) or 0 for message in materialized) > MAX_CONTEXT_BYTES:
+        raise AdmissionError(400, "context_limit", "invalid_input", "Turn context exceeded a limit.")

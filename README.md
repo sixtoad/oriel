@@ -60,6 +60,12 @@ curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
 curl -s http://127.0.0.1:8080/v1/requests/<request_id>
 ```
 
+Session context is volatile and isolated by its opaque session handle. A first
+turn may supply `context`; later turns use the retained transcript only. Reset
+it with `POST /v1/sessions/<session_id>/reset`, which returns the next context
+generation, or remove it with `DELETE /v1/sessions/<session_id>`. The runtime
+cleans up sessions after 30 minutes idle or 24 hours total lifetime.
+
 The stream starts with `accepted`, emits ordered `content_delta` events, and
 ends with one `terminal` event. Status lookup is passive and never replays a
 turn. The bootstrap uses the packaged non-secret fixture, makes no provider or

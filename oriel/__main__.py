@@ -5,7 +5,7 @@ import argparse
 import json
 from http.client import HTTPConnection
 
-from .adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
 from .adapters.configuration import load_startup
 from .adapters.http import HealthServer
 from .application.text_gateway import TextGateway
@@ -51,13 +51,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
     startup = load_startup(args.config)
-    gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
+    gateway = TextGateway(FakeModel(), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
     server = HealthServer(startup, gateway, args.host, args.port)
+    cleanup = CleanupTrigger(gateway.expire_sessions)
+    cleanup.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
+        cleanup.close()
         server.close()
     return 0
 

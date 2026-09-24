@@ -77,6 +77,17 @@ def _handler(startup: StartupState, gateway: TextGateway | None) -> type[BaseHTT
                     self._send_admission_error(failure)
                 return
             prefix = "/v1/sessions/"
+            reset_suffix = "/reset"
+            if self.path.startswith(prefix) and self.path.endswith(reset_suffix):
+                session_id = self.path[len(prefix) : -len(reset_suffix)]
+                if not _opaque_path_id(session_id):
+                    self._not_found()
+                    return
+                try:
+                    self._send_json(200, gateway.reset_session(session_id).payload())
+                except AdmissionError as failure:
+                    self._send_admission_error(failure)
+                return
             suffix = "/turns"
             if self.path.startswith(prefix) and self.path.endswith(suffix):
                 session_id = self.path[len(prefix) : -len(suffix)]
@@ -96,6 +107,24 @@ def _handler(startup: StartupState, gateway: TextGateway | None) -> type[BaseHTT
                     self._send_stream(events)
                 return
             self._not_found()
+
+        def do_DELETE(self) -> None:  # noqa: N802 - HTTP method spelling is prescribed.
+            prefix = "/v1/sessions/"
+            if gateway is None or not self.path.startswith(prefix):
+                self._not_found()
+                return
+            session_id = self.path[len(prefix) :]
+            if not _opaque_path_id(session_id):
+                self._not_found()
+                return
+            try:
+                gateway.end_session(session_id)
+            except AdmissionError as failure:
+                self._send_admission_error(failure)
+            else:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
         def _read_body(self) -> bytes:
             try:
