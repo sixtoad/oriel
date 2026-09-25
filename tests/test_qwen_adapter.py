@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import tempfile
+import time
+from threading import Thread
+import unittest
+
+from oriel.adapters.bootstrap import FixedClock, NoopTelemetry, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, provider_profile_resolver
+from oriel.adapters.http import HealthServer
+from oriel.adapters.qwen import OpenAICompatibleStreamingModel
+from oriel.application.startup import StartupState
+from oriel.application.text_gateway import TextGateway
+from oriel.domain.configuration import parse_core_config
+from scripts.validate_api_contract import validate_stream
+
+
+READY = StartupState(parse_core_config({"api_version": "1.0", "provider": {"connection_ref": "worker"}, "skills": {}}), None)
+
+
+class RecordingTools:
+    def __init__(self) -> None:
+        self.dispatched = False
+
+    def dispatch(self, name: str, arguments: dict[str, str]) -> None:
+        del name, arguments
+        self.dispatched = True
+
+
+class ScriptedWorker:
+    def __init__(self, records: list[bytes], pause_seconds: float = 0.0) -> None:
+        self.records = records
+        self.pause_seconds = pause_seconds
+        self.requests: list[dict[str, object]] = []
+
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - HTTP method spelling is prescribed.
+                length = int(self.headers["Content-Length"])
+                owner.requests.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.end_headers()
+                for index, record in enumerate(owner.records):
+                    self.wfile.write(record)
+                    self.wfile.flush()
+                    if index == 0 and owner.pause_seconds:
+                        time.sleep(owner.pause_seconds)
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def request_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}/v1/chat/completions"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._thread.join(timeout=2)
+        self._server.server_close()
+
+
+def data(payload: object) -> bytes:
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n\n"
+
+
+def completed_stream(*chunks: str) -> list[bytes]:
+    records = [data({"choices": [{"delta": {"content": chunk}, "finish_reason": None}]}) for chunk in chunks]
+    return [*records, data({"choices": [{"delta": {}, "finish_reason": "stop"}]}), b"data: [DONE]\n\n"]
+
+
+class QwenAdapterTests(unittest.TestCase):
+    def worker_server(self, records: list[bytes], pause_seconds: float = 0.0) -> ScriptedWorker:
+        worker = ScriptedWorker(records, pause_seconds)
+        worker.start()
+        self.addCleanup(worker.close)
+        return worker
+
+    def gateway_server(self, worker: ScriptedWorker, tools: RecordingTools | None = None) -> HealthServer:
+        profile = OpenAICompatibleProfile(worker.request_url, "qwen-test-revision", 128)
+        gateway = TextGateway(
+            OpenAICompatibleStreamingModel(profile),
+            FixedClock(),
+            VolatileState(),
+            NoopTelemetry(),
+            tools or RecordingTools(),
+            SequentialIds(),
+            ThreadSafeSynchronization(),
+        )
+        server = HealthServer(READY, gateway)
+        server.start()
+        self.addCleanup(server.close)
+        return server
+
+    def request(self, server: HealthServer, method: str, path: str, body: bytes | None = None) -> tuple[HTTPConnection, object]:
+        host, port = server.address
+        connection = HTTPConnection(host, port, timeout=3)
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        connection.request(method, path, body=body, headers=headers)
+        return connection, connection.getresponse()
+
+    def session_id(self, server: HealthServer) -> str:
+        connection, response = self.request(server, "POST", "/v1/sessions")
+        try:
+            self.assertEqual(response.status, 201)
+            return str(json.loads(response.read())["session_id"])
+        finally:
+            connection.close()
+
+    def read_frame(self, response: object) -> tuple[str, dict[str, object]]:
+        event_line = response.fp.readline().decode("utf-8").rstrip("\n")  # type: ignore[attr-defined]
+        data_line = response.fp.readline().decode("utf-8").rstrip("\n")  # type: ignore[attr-defined]
+        self.assertEqual(response.fp.readline(), b"\n")  # type: ignore[attr-defined]
+        return event_line[7:], json.loads(data_line[6:])
+
+    def stream_turn(self, server: HealthServer, session_id: str, text: str) -> list[tuple[str, dict[str, object]]]:
+        connection, response = self.request(server, "POST", f"/v1/sessions/{session_id}/turns", json.dumps({"input": text}).encode("utf-8"))
+        try:
+            self.assertEqual(response.status, 200)
+            frames: list[tuple[str, dict[str, object]]] = []
+            while not frames or frames[-1][0] != "terminal":
+                frames.append(self.read_frame(response))
+            return frames
+        finally:
+            connection.close()
+
+    def test_streams_early_deltas_and_preserves_attributed_followup_transcript(self) -> None:
+        worker = self.worker_server(completed_stream("hello", " again"), pause_seconds=0.12)
+        server = self.gateway_server(worker)
+        session = self.session_id(server)
+
+        connection, response = self.request(server, "POST", f"/v1/sessions/{session}/turns", b'{"input":"first"}')
+        self.assertEqual(response.status, 200)
+        try:
+            first = [self.read_frame(response), self.read_frame(response)]
+            first_delta_at = time.monotonic()
+            while first[-1][0] != "terminal":
+                first.append(self.read_frame(response))
+            terminal_at = time.monotonic()
+        finally:
+            connection.close()
+        second = self.stream_turn(server, session, "follow-up")
+
+        self.assertEqual([kind for kind, _ in first], ["accepted", "content_delta", "content_delta", "terminal"])
+        self.assertEqual([kind for kind, _ in second], ["accepted", "content_delta", "content_delta", "terminal"])
+        self.assertGreater(terminal_at - first_delta_at, 0.1)
+        self.assertEqual(worker.requests[0]["stream"], True)
+        self.assertEqual(worker.requests[0]["model"], "qwen-test-revision")
+        self.assertEqual(worker.requests[1]["messages"], [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "hello again"},
+            {"role": "user", "content": "follow-up"},
+        ])
+
+    def test_private_registry_selects_only_the_opaque_reference(self) -> None:
+        worker = ScriptedWorker([])
+        worker.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                registry = Path(directory) / "profiles.json"
+                registry.write_text(json.dumps({"profiles": {"worker": {
+                    "request_url": worker.request_url,
+                    "model_revision": "qwen-test-revision",
+                    "generation": {"max_tokens": 128},
+                    "credential_ref": "TEST_WORKER_CREDENTIAL",
+                }}}), encoding="utf-8")
+                resolver = provider_profile_resolver({"ORIEL_PROVIDER_PROFILES_PATH": str(registry)})
+                profile = resolver.resolve("worker")
+                self.assertIsInstance(profile, OpenAICompatibleProfile)
+                self.assertEqual(profile.model_revision, "qwen-test-revision")
+                with self.assertRaises(ProfileUnavailable):
+                    resolver.resolve("other")
+        finally:
+            worker.close()
+
+    def test_malformed_worker_frame_is_a_sanitized_terminal_failure(self) -> None:
+        worker = self.worker_server([b"data: {not-json}\n\n"])
+        server = self.gateway_server(worker)
+        frames = self.stream_turn(server, self.session_id(server), "hello")
+
+        self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
+        self.assertEqual(frames[-2][1]["error"]["code"], "model_failure")
+        self.assertEqual(frames[-1][1]["outcome"], "failed")
+        self.assertNotIn(worker.request_url, json.dumps(frames))
+
+    def test_complete_valid_tool_call_becomes_proposal_without_dispatch(self) -> None:
+        proposal = {
+            "proposal_version": "1.0",
+            "proposal_id": "proposal-1",
+            "action": "sample_action",
+            "target": "synthetic:sample-target",
+            "arguments": {"values": ["sample"]},
+            "dry_run": True,
+            "idempotency": "idem-1",
+            "deadline": "2030-01-02T12:34:00Z",
+            "confirmation": {"required": True, "evidence": None},
+        }
+        arguments = json.dumps(proposal, separators=(",", ":"))
+        split = len(arguments) // 2
+        worker = self.worker_server([
+            data({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "oriel-proposal-v1", "arguments": arguments[:split]}}]}, "finish_reason": None}]}),
+            data({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": arguments[split:]}}]}, "finish_reason": None}]}),
+            data({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            b"data: [DONE]\n\n",
+        ])
+        tools = RecordingTools()
+        server = self.gateway_server(worker, tools)
+        frames = self.stream_turn(server, self.session_id(server), "propose")
+
+        self.assertEqual([kind for kind, _ in frames], ["accepted", "proposal", "terminal"])
+        self.assertEqual(frames[1][1]["proposal"], proposal)
+        self.assertEqual(frames[-1][1]["outcome"], "completed")
+        self.assertFalse(tools.dispatched)
+        self.assertEqual(validate_stream([payload for _kind, payload in frames]), [])
+
+    def test_mixed_tool_content_fails_safely_without_dispatch(self) -> None:
+        worker = self.worker_server([
+            data({"choices": [{"delta": {"content": "ordinary", "tool_calls": []}, "finish_reason": None}]}),
+        ])
+        tools = RecordingTools()
+        server = self.gateway_server(worker, tools)
+        frames = self.stream_turn(server, self.session_id(server), "hello")
+
+        self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
+        self.assertEqual(frames[-1][1]["outcome"], "failed")
+        self.assertFalse(tools.dispatched)
+
+    def test_invalid_profile_url_is_a_sanitized_unavailable_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "profiles.json"
+            registry.write_text(json.dumps({"profiles": {"worker": {
+                "request_url": "http://[",
+                "model_revision": "qwen-test-revision",
+                "generation": {"max_tokens": 128},
+            }}}), encoding="utf-8")
+            with self.assertRaises(ProfileUnavailable):
+                provider_profile_resolver({"ORIEL_PROVIDER_PROFILES_PATH": str(registry)})
+
+
+if __name__ == "__main__":
+    unittest.main()

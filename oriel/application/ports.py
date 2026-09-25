@@ -25,7 +25,14 @@ class ModelOutcome:
     outcome: str
 
 
-ModelStreamItem = ModelChunk | ModelOutcome
+@dataclass(frozen=True)
+class ModelProposal:
+    """One untrusted, provider-neutral generic proposal from a model stream."""
+
+    proposal: Mapping[str, object]
+
+
+ModelStreamItem = ModelChunk | ModelOutcome | ModelProposal
 
 
 @dataclass(frozen=True)

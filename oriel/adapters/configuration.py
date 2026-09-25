@@ -8,6 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlparse
 
 from ..application.configuration import ActivationResult, ActivationSucceeded, ConfigurationService
 from ..application.startup import StartupState, UNREADY_CODE
@@ -27,10 +28,24 @@ class ResolvedProviderProfile:
     label: str
 
 
+@dataclass(frozen=True)
+class OpenAICompatibleProfile:
+    """Private, restart-applied connection material for one local worker."""
+
+    request_url: str
+    model_revision: str
+    max_tokens: int
+    credential_ref: str | None = None
+    label: str = "local-qwen"
+
+
+ProviderProfile = ResolvedProviderProfile | OpenAICompatibleProfile
+
+
 class ProviderProfileResolver(Protocol):
     """Resolves an opaque connection reference without changing core policy."""
 
-    def resolve(self, connection_ref: str) -> ResolvedProviderProfile: ...
+    def resolve(self, connection_ref: str) -> ProviderProfile: ...
 
 
 class StaticProfileResolver:
@@ -47,6 +62,86 @@ class StaticProfileResolver:
         if not isinstance(profile, ResolvedProviderProfile) or not isinstance(profile.label, str):
             raise ProfileUnavailable("provider profile is unavailable")
         return profile
+
+
+class ProfileRegistryResolver:
+    """Maps opaque core references to private OpenAI-compatible profiles."""
+
+    def __init__(self, profiles: Mapping[str, OpenAICompatibleProfile]) -> None:
+        self._profiles = MappingProxyType(dict(profiles))
+
+    def resolve(self, connection_ref: str) -> OpenAICompatibleProfile:
+        try:
+            profile = self._profiles[connection_ref]
+        except KeyError:
+            raise ProfileUnavailable("provider profile is unavailable") from None
+        if not isinstance(profile, OpenAICompatibleProfile):
+            raise ProfileUnavailable("provider profile is unavailable")
+        return profile
+
+
+def load_provider_profiles(path: Path) -> ProfileRegistryResolver:
+    """Load the operator-only profile registry without surfacing its material."""
+    try:
+        document = load_json(path)
+        if not isinstance(document, dict) or set(document) != {"profiles"} or not isinstance(document["profiles"], dict):
+            raise ConfigError("invalid provider profiles")
+        profiles = {reference: _parse_openai_profile(profile) for reference, profile in document["profiles"].items() if _is_profile_reference(reference)}
+        if len(profiles) != len(document["profiles"]):
+            raise ConfigError("invalid provider profiles")
+        return ProfileRegistryResolver(profiles)
+    except ConfigError:
+        raise ProfileUnavailable("provider profile is unavailable") from None
+
+
+def select_provider_profiles_path(environ: Mapping[str, str] | None = None) -> Path | None:
+    """Return the optional operator-only registry path without a public fallback."""
+    source = os.environ if environ is None else environ
+    value = source.get("ORIEL_PROVIDER_PROFILES_PATH")
+    return None if value is None else Path(value)
+
+
+def provider_profile_resolver(environ: Mapping[str, str] | None = None) -> ProviderProfileResolver:
+    """Keep the fake bootstrap until an operator selects a private worker registry."""
+    path = select_provider_profiles_path(environ)
+    if path is None:
+        return StaticProfileResolver(
+            {
+                "fake-model": ResolvedProviderProfile("bootstrap-fake"),
+                "fake": ResolvedProviderProfile("bootstrap-fake"),
+            }
+        )
+    return load_provider_profiles(path)
+
+
+def _parse_openai_profile(value: object) -> OpenAICompatibleProfile:
+    if not isinstance(value, dict) or set(value) - {"request_url", "model_revision", "generation", "credential_ref"}:
+        raise ConfigError("invalid provider profiles")
+    if {"request_url", "model_revision", "generation"} - set(value):
+        raise ConfigError("invalid provider profiles")
+    request_url = value["request_url"]
+    model_revision = value["model_revision"]
+    credential_ref = value.get("credential_ref")
+    generation = value["generation"]
+    if not _valid_request_url(request_url) or not _is_profile_reference(model_revision) or credential_ref is not None and not _is_profile_reference(credential_ref):
+        raise ConfigError("invalid provider profiles")
+    if not isinstance(generation, dict) or set(generation) != {"max_tokens"} or type(generation["max_tokens"]) is not int or not 1 <= generation["max_tokens"] <= 4096:
+        raise ConfigError("invalid provider profiles")
+    return OpenAICompatibleProfile(request_url, model_revision, generation["max_tokens"], credential_ref)
+
+
+def _valid_request_url(value: object) -> bool:
+    if not isinstance(value, str) or len(value) > 2048:
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and parsed.username is None and parsed.password is None and not parsed.query and not parsed.fragment
+
+
+def _is_profile_reference(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= 256
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -107,7 +202,7 @@ def activate_startup(
     explicit_path: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
     default_path: Path = DEFAULT_CONFIG_PATH,
-) -> tuple[StartupState, ResolvedProviderProfile | None]:
+) -> tuple[StartupState, ProviderProfile | None]:
     """Select, validate, resolve, and atomically activate one startup document.
 
     The resolver is supplied by the composition root. A missing profile is a

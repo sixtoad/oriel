@@ -67,6 +67,13 @@ class ApiContractTests(unittest.TestCase):
         over_content = copy.deepcopy(valid)
         over_content[2]["content"] = "x" * 65537
         self.assertIn("cumulative streamed", "\n".join(validate_stream(over_content)))
+        proposal_stream = copy.deepcopy(valid)
+        proposal_stream[2].pop("content")
+        proposal_stream[2]["type"] = "proposal"
+        proposal_stream[2]["proposal"] = load_json(EXAMPLES / "valid" / "generic-action.json")["proposal"]
+        self.assertEqual(validate_stream(proposal_stream), [])
+        proposal_stream[2].pop("proposal")
+        self.assertIn("requires proposal", "\n".join(validate_stream(proposal_stream)))
 
     def test_closed_documents_and_caps_reject_extensions_or_overflow(self):
         config = load_json(EXAMPLES / "valid" / "config-precedence.json")

@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 from http.client import HTTPConnection
+from typing import Mapping
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
-from .adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
+from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, activate_startup, provider_profile_resolver
 from .adapters.http import HealthServer
+from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
 from .application.configuration import ConfigurationService
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION
@@ -24,16 +26,27 @@ def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
         connection.close()
 
 
-def _compose_startup(config_path: str | None = None):
+def _compose_startup(config_path: str | None = None, environ: Mapping[str, str] | None = None):
     """Select the one local profile resolver and activate configuration once."""
     configuration = ConfigurationService(ThreadSafeSynchronization())
-    resolver = StaticProfileResolver(
-        {
-            "fake-model": ResolvedProviderProfile("bootstrap-fake"),
-            "fake": ResolvedProviderProfile("bootstrap-fake"),
-        }
-    )
-    return activate_startup(configuration, resolver, explicit_path=config_path)
+    try:
+        resolver = provider_profile_resolver(environ)
+    except ProfileUnavailable:
+        # Preserve the config adapter's sanitized unavailable-profile outcome.
+        resolver = _UnavailableProfileResolver()
+    return activate_startup(configuration, resolver, explicit_path=config_path, environ=environ)
+
+
+class _UnavailableProfileResolver:
+    def resolve(self, connection_ref: str):
+        del connection_ref
+        raise ProfileUnavailable("provider profile is unavailable")
+
+
+def _model_for_profile(profile: object, environ: Mapping[str, str] | None = None):
+    if isinstance(profile, OpenAICompatibleProfile):
+        return OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
+    return FakeModel()
 
 
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
@@ -64,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
     startup, _profile = _compose_startup(args.config)
-    gateway = TextGateway(FakeModel(), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
+    gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()

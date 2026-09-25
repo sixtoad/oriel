@@ -4,9 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Mapping
 
-from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
+from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
 MAX_FAKE_TURN_OUTPUT_BYTES = 4096
@@ -44,6 +45,7 @@ class StreamEvent:
     context_generation: int
     seq: int
     content: str | None = None
+    proposal: Mapping[str, object] | None = None
     error: Mapping[str, object] | None = None
     outcome: str | None = None
 
@@ -51,6 +53,8 @@ class StreamEvent:
         payload: dict[str, object] = {"api_version": API_VERSION, "type": self.type, "request_id": self.request_id, "session_id": self.session_id, "trace_id": self.trace_id, "context_generation": self.context_generation, "seq": self.seq}
         if self.content is not None:
             payload["content"] = self.content
+        if self.proposal is not None:
+            payload["proposal"] = dict(self.proposal)
         if self.error is not None:
             payload["error"] = dict(self.error)
         if self.outcome is not None:
@@ -190,6 +194,8 @@ class TextGateway:
                 yield self._terminal(request, "failed")
                 return
             saw_outcome = False
+            saw_content = False
+            saw_proposal = False
             streamed_bytes = 0
             response_parts: list[str] = []
             provider_stream = iter(model.stream(model_input))  # type: ignore[union-attr]
@@ -202,18 +208,30 @@ class TextGateway:
                 except StopIteration:
                     break
                 if isinstance(item, ModelChunk):
+                    if saw_proposal:
+                        yield self._error(request, "invalid_stream", "uncertainty", "Model output is unavailable.", False)
+                        yield self._terminal(request, "outcome_unknown")
+                        return
                     byte_count = _utf8_length(item.content)
                     if byte_count is None or byte_count == 0 or byte_count > MAX_STREAM_EVENT_CONTENT_BYTES or streamed_bytes + byte_count > MAX_STREAM_CONTENT_BYTES:
                         yield self._error(request, "stream_limit", "internal_failure", "Stream output exceeded a limit.", False)
                         yield self._terminal(request, "failed")
                         return
                     streamed_bytes += byte_count
+                    saw_content = True
                     delta = self._content_delta(request, item.content)
                     if delta is None:
                         yield self._terminal(request, "cancelled")
                         return
                     response_parts.append(item.content)
                     yield delta
+                elif isinstance(item, ModelProposal):
+                    if saw_content or saw_proposal or not validate_proposal(item.proposal) or not proposal_event_size_is_bounded(item.proposal):
+                        yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
+                        yield self._terminal(request, "outcome_unknown")
+                        return
+                    saw_proposal = True
+                    yield self._event(request, "proposal", proposal=item.proposal)
                 elif isinstance(item, ModelOutcome):
                     if saw_outcome:
                         yield self._error(request, "invalid_outcome", "uncertainty", "Model outcome is unavailable.", False)

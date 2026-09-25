@@ -14,11 +14,13 @@
     "context_generation": {"type": "integer", "minimum": 0},
     "seq": {"type": "integer", "minimum": 1},
     "content": {"type": "string", "maxLength": 65536},
+    "proposal": {"$ref": "proposal.json"},
     "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]},
     "error": {"$ref": "error.json#/properties/error"}
   },
   "allOf": [
     {"if": {"properties": {"type": {"const": "content_delta"}}}, "then": {"required": ["content"]}},
+    {"if": {"properties": {"type": {"const": "proposal"}}}, "then": {"required": ["proposal"]}},
     {"if": {"properties": {"type": {"const": "error"}}}, "then": {"required": ["error"]}},
     {"if": {"properties": {"type": {"const": "terminal"}}}, "then": {"required": ["outcome"]}},
     {"if": {"properties": {"type": {"const": "ack"}}}, "then": {"not": {"required": ["outcome"]}}}
