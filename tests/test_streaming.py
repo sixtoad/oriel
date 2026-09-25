@@ -9,8 +9,9 @@ import time
 import unittest
 
 from oriel.adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
-from oriel.adapters.configuration import load_startup
+from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
+from oriel.application.configuration import ConfigurationService
 from oriel.application.ports import ModelChunk
 from oriel.application.text_gateway import TextGateway
 
@@ -44,7 +45,11 @@ class StreamingHttpTests(unittest.TestCase):
         self._directory = tempfile.TemporaryDirectory()
         config = Path(self._directory.name) / "config.json"
         config.write_text(VALID_CONFIG, encoding="utf-8")
-        self.startup = load_startup(config)
+        self.startup, _profile = activate_startup(
+            ConfigurationService(ThreadSafeSynchronization()),
+            StaticProfileResolver({"fake": ResolvedProviderProfile("test")}),
+            explicit_path=config,
+        )
 
     def tearDown(self) -> None:
         self._directory.cleanup()

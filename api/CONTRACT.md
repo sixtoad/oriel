@@ -22,7 +22,7 @@ Canonical JSON is UTF-8 with lexicographically ordered object keys, no duplicate
 
 ## Configuration and generic actions
 
-Configuration is an immutable restart-applied document. The explicit `--config` path wins over `ORIEL_CONFIG_PATH`, which wins over the packaged default. There are no per-field environment overrides. It contains connection references only, never secret values. Invalid core configuration leaves the service unready; invalid optional skill configuration disables that skill.
+Configuration is an immutable restart-applied document. The explicit `--config` path wins over `ORIEL_CONFIG_PATH`, which wins over the packaged default. There are no per-field environment overrides. It contains connection references only, never secret values. Startup activates whole validated documents by revision; a stale or invalid candidate leaves the active revision unchanged. The composition root alone resolves an opaque connection reference into a private provider profile. A profile change takes effect only on the next process start. Invalid core configuration or an unavailable profile leaves a process with no active revision unready; invalid optional skill configuration disables that skill. The sanitized effective view contains only API version, revision, provider readiness/profile label, and disabled optional-skill names.
 
 The manifest, proposal, and result grammar is generic and versioned. Targets are synthetic, every manifest action is disabled by default, and proposals carry a deadline, dry-run flag, idempotency key, and confirmation evidence. These artifacts select no real operation, target, provider, endpoint, or credential.
 

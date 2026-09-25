@@ -6,8 +6,9 @@ import json
 from http.client import HTTPConnection
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
-from .adapters.configuration import load_startup
+from .adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from .adapters.http import HealthServer
+from .application.configuration import ConfigurationService
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION
 
@@ -23,9 +24,21 @@ def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
         connection.close()
 
 
+def _compose_startup(config_path: str | None = None):
+    """Select the one local profile resolver and activate configuration once."""
+    configuration = ConfigurationService(ThreadSafeSynchronization())
+    resolver = StaticProfileResolver(
+        {
+            "fake-model": ResolvedProviderProfile("bootstrap-fake"),
+            "fake": ResolvedProviderProfile("bootstrap-fake"),
+        }
+    )
+    return activate_startup(configuration, resolver, explicit_path=config_path)
+
+
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
-    startup = load_startup(config_path)
+    startup, _profile = _compose_startup(config_path)
     core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
     server = HealthServer(startup, core)
     server.start()
@@ -50,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
-    startup = load_startup(args.config)
+    startup, _profile = _compose_startup(args.config)
     gateway = TextGateway(FakeModel(), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)

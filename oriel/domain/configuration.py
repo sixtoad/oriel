@@ -53,4 +53,6 @@ def parse_core_config(document: object) -> CoreConfig:
             disabled.append(name)
         elif valid["enabled"]:
             enabled_skills[name] = valid
+        else:
+            disabled.append(name)
     return CoreConfig(str(provider["connection_ref"]), MappingProxyType(enabled_skills), tuple(disabled))

@@ -6,11 +6,22 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from oriel.adapters.configuration import load_startup
+from oriel.adapters.bootstrap import ThreadSafeSynchronization
+from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
+from oriel.application.configuration import ConfigurationService
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
+
+
+def canonical_startup(path: str | Path):
+    state, _profile = activate_startup(
+        ConfigurationService(ThreadSafeSynchronization()),
+        StaticProfileResolver({"fake": ResolvedProviderProfile("test")}),
+        explicit_path=path,
+    )
+    return state
 
 
 class HttpTests(unittest.TestCase):
@@ -34,7 +45,7 @@ class HttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "valid.json"
             path.write_text(VALID_CONFIG, encoding="utf-8")
-            server = self.with_server(load_startup(path))
+            server = self.with_server(canonical_startup(path))
             live_status, _headers, live_body = self.request(server, "/live")
             ready_status, headers, ready_body = self.request(server, "/ready")
         self.assertEqual(live_status, 200)
@@ -50,7 +61,7 @@ class HttpTests(unittest.TestCase):
                 '{"api_version":"1.0","provider":{"connection_ref":"PRIVATE_REFERENCE_MUST_NOT_LEAK","secret":"PRIVATE_PAYLOAD_MUST_NOT_LEAK"},"skills":{}}',
                 encoding="utf-8",
             )
-            server = self.with_server(load_startup(private_path))
+            server = self.with_server(canonical_startup(private_path))
             live_status, _live_headers, live_body = self.request(server, "/live")
             ready_status, _ready_headers, ready_body = self.request(server, "/ready")
         self.assertEqual(live_status, 200)
@@ -61,7 +72,7 @@ class HttpTests(unittest.TestCase):
             self.assertNotIn(private_value, ready_body.decode("utf-8"))
 
     def test_only_health_paths_are_exposed(self):
-        server = self.with_server(load_startup("missing.json"))
+        server = self.with_server(canonical_startup("missing.json"))
         status, _headers, body = self.request(server, "/v1/sessions")
         self.assertEqual(status, 404)
         self.assertEqual(body, b"")

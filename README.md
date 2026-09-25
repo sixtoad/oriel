@@ -71,6 +71,18 @@ ends with one `terminal` event. Status lookup is passive and never replays a
 turn. The bootstrap uses the packaged non-secret fixture, makes no provider or
 Home Assistant call, and stores nothing persistently.
 
+## Configuration activation
+
+Configuration is selected as one whole document: `--config`, then
+`ORIEL_CONFIG_PATH`, then the packaged default. It is strictly validated and
+activated once at process start by revision. The provider `connection_ref` is
+opaque; only the composition root resolves it to an adapter-private profile.
+Changing that profile mapping takes effect after restart, never by rewiring a
+running process. The available effective configuration view is sanitized to
+the API version, active revision, provider readiness/profile label, and names
+of disabled optional skills; it never contains a reference, endpoint,
+credential, header, or model setting.
+
 ## Mutation testing
 
 Mutation testing checks whether the focused gateway tests reject small changes
