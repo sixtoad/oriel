@@ -86,6 +86,36 @@ class StatePort(Protocol):
     def record_turn(self, input_text: str, output_text: str, occurred_at: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class RequestStatusRecord:
+    """The payload-free durable correlation state for one admitted turn."""
+
+    request_id: str
+    session_id: str
+    trace_id: str
+    context_generation: int
+    state: str
+    outcome: str | None
+    admitted_at: str
+    expires_at: str
+
+
+class RequestLedgerUnavailable(RuntimeError):
+    """A storage adapter could not complete a durable ledger operation."""
+
+
+class RequestLedgerPort(Protocol):
+    """Durably reserves and reports server-generated request identities."""
+
+    def reserve(self, record: RequestStatusRecord) -> None: ...
+
+    def mark_terminal(self, request_id: str, outcome: str) -> None: ...
+
+    def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None: ...
+
+    def recover_interrupted(self) -> None: ...
+
+
 class TelemetryPort(Protocol):
     """Receives bounded operational facts without defining their storage."""
 

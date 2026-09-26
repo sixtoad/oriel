@@ -9,7 +9,7 @@ import time
 from threading import Thread
 import unittest
 
-from oriel.adapters.bootstrap import FixedClock, NoopTelemetry, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import FixedClock, InMemoryRequestLedger, NoopTelemetry, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, provider_profile_resolver
 from oriel.adapters.http import HealthServer
 from oriel.adapters.qwen import OpenAICompatibleStreamingModel
@@ -98,6 +98,7 @@ class QwenAdapterTests(unittest.TestCase):
             tools or RecordingTools(),
             SequentialIds(),
             ThreadSafeSynchronization(),
+            InMemoryRequestLedger(),
         )
         server = HealthServer(READY, gateway)
         server.start()

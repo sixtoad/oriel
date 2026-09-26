@@ -7,7 +7,7 @@ from threading import Event, RLock, Thread
 import time
 from typing import Callable, Iterable, Mapping
 
-from ..application.ports import ModelChunk, ModelInput, ModelOutcome, ModelStreamItem
+from ..application.ports import ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
 
 
 @dataclass(frozen=True)
@@ -151,6 +151,54 @@ class VolatileState:
 
     def record_turn(self, input_text: str, output_text: str, occurred_at: str) -> None:
         del input_text, output_text, occurred_at
+
+
+@dataclass
+class InMemoryRequestLedger:
+    """Deterministic payload-free ledger for focused gateway tests and self-test."""
+
+    records: dict[str, RequestStatusRecord] = field(default_factory=dict)
+
+    def reserve(self, record: RequestStatusRecord) -> None:
+        self.records[record.request_id] = record
+
+    def mark_terminal(self, request_id: str, outcome: str) -> None:
+        record = self.records[request_id]
+        self.records[request_id] = RequestStatusRecord(
+            record.request_id, record.session_id, record.trace_id, record.context_generation,
+            "terminal", outcome, record.admitted_at, record.expires_at,
+        )
+
+    def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None:
+        record = self.records.get(request_id)
+        if record is None or record.expires_at <= now:
+            self.records.pop(request_id, None)
+            return None
+        return record
+
+    def recover_interrupted(self) -> None:
+        for request_id, record in tuple(self.records.items()):
+            if record.state == "in_progress":
+                self.mark_terminal(request_id, "failed")
+
+
+class UnavailableRequestLedger:
+    """Safe composition fallback when the durable ledger cannot be owned."""
+
+    def reserve(self, record: RequestStatusRecord) -> None:
+        del record
+        raise RequestLedgerUnavailable()
+
+    def mark_terminal(self, request_id: str, outcome: str) -> None:
+        del request_id, outcome
+        raise RequestLedgerUnavailable()
+
+    def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None:
+        del request_id, now
+        raise RequestLedgerUnavailable()
+
+    def recover_interrupted(self) -> None:
+        raise RequestLedgerUnavailable()
 
 
 @dataclass

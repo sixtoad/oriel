@@ -62,7 +62,10 @@ def _handler(startup: StartupState, gateway: TextGateway | None) -> type[BaseHTT
             elif self.path == "/ready":
                 self._send_json(200 if startup.ready else 503, ready_payload(startup))
             elif self.path.startswith("/v1/requests/") and gateway is not None and self.path.count("/") == 3 and _opaque_path_id(self.path.rsplit("/", 1)[-1]):
-                self._send_json(200, gateway.request_status(self.path.rsplit("/", 1)[-1]))
+                try:
+                    self._send_json(200, gateway.request_status(self.path.rsplit("/", 1)[-1]))
+                except AdmissionError as failure:
+                    self._send_admission_error(failure)
             else:
                 self._not_found()
 

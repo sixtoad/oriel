@@ -4,13 +4,17 @@ from pathlib import Path
 import tempfile
 from threading import Barrier, Thread
 import unittest
+from unittest.mock import patch
 
 from oriel.adapters.bootstrap import ThreadSafeSynchronization
 from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path
+from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ActivationConflict, ActivationRejected, ActivationSucceeded, ConfigurationService, READY_PROFILE_LABEL
+from oriel.application.ports import RequestStatusRecord
 from oriel.application.startup import UNREADY_CODE
+from oriel.application.text_gateway import AdmissionError
 from oriel.domain.configuration import CoreConfig, parse_core_config
-from oriel.__main__ import _compose_startup
+from oriel.__main__ import _compose_startup, main
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -41,6 +45,38 @@ class StartupTests(unittest.TestCase):
         path = directory / name
         path.write_text(content, encoding="utf-8")
         return path
+
+    def test_runnable_composition_recovers_closed_ledger_and_fails_closed_when_unavailable(self):
+        class CapturingServer:
+            instances: list[object] = []
+
+            def __init__(self, startup, gateway, host, port):
+                del startup, host, port
+                self.gateway = gateway
+                self.instances.append(self)
+
+            def serve_forever(self):
+                return None
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory, patch("oriel.__main__.HealthServer", CapturingServer):
+            root = Path(directory)
+            config = self.write(root, "config.json", VALID_CONFIG)
+            ledger_path = root / "ledger.sqlite3"
+            ledger = SQLiteRequestLedger(ledger_path)
+            ledger.reserve(RequestStatusRecord("request-1", "session-1", "trace-1", 0, "in_progress", None, "2026-09-26T10:00:00Z", "2026-09-27T10:00:00Z"))
+            ledger.close()
+
+            self.assertEqual(main(["--config", str(config), "--ledger", str(ledger_path)]), 0)
+            recovered = CapturingServer.instances[-1].gateway.request_status("request-1")
+            self.assertEqual((recovered["state"], recovered["outcome"]), ("terminal", "failed"))
+
+            self.assertEqual(main(["--config", str(config), "--ledger", str(root)]), 0)
+            with self.assertRaises(AdmissionError) as unavailable:
+                CapturingServer.instances[-1].gateway.request_status("request-1")
+            self.assertEqual(unavailable.exception.status, 503)
 
     def test_explicit_path_wins_over_environment_then_packaged_default(self):
         with tempfile.TemporaryDirectory() as directory:

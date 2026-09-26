@@ -8,11 +8,12 @@ import tempfile
 import time
 import unittest
 
-from oriel.adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
+from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
-from oriel.application.ports import ModelChunk
+from oriel.application.ports import ModelChunk, RequestLedgerUnavailable
 from oriel.application.text_gateway import TextGateway
 
 
@@ -54,8 +55,8 @@ class StreamingHttpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._directory.cleanup()
 
-    def with_server(self, model: FakeModel) -> HealthServer:
-        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+    def with_server(self, model: FakeModel, ledger: object | None = None) -> HealthServer:
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger())
         server = HealthServer(self.startup, gateway)
         server.start()
         self.addCleanup(server.close)
@@ -141,6 +142,115 @@ class StreamingHttpTests(unittest.TestCase):
             self.assertEqual(model.calls, 1)
         finally:
             connection.close()
+
+    def test_reservation_precedes_accepted_stream_and_model_work(self):
+        model = CountingModel()
+        ledger = InMemoryRequestLedger()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger)
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(len(ledger.records), 1)
+        accepted = next(events)
+        self.assertEqual(accepted.type, "accepted")
+        self.assertEqual(model.calls, 0)
+        list(events)
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(gateway.request_status(accepted.request_id)["state"], "terminal")
+
+    def test_ledger_reservation_failure_returns_safe_http_error_without_model_work(self):
+        class UnavailableLedger:
+            def reserve(self, record):
+                del record
+                raise RequestLedgerUnavailable()
+
+            def mark_terminal(self, request_id, outcome):
+                del request_id, outcome
+                raise AssertionError("terminal transition must not be attempted")
+
+            def lookup(self, request_id, now):
+                del request_id, now
+                raise RequestLedgerUnavailable()
+
+            def recover_interrupted(self):
+                raise AssertionError("recovery is not part of admission")
+
+        model = CountingModel()
+        server = self.with_server(model, UnavailableLedger())
+        session = self.create_session(server)
+        connection, response = self.turn_response(server, str(session["session_id"]), b'{"input":"hello"}')
+        try:
+            self.assertEqual(response.status, 503)
+            self.assertEqual(json.loads(response.read())["error"], {"code": "request_ledger_unavailable", "category": "dependency_unavailable", "message": "Request status storage is unavailable.", "retryable": True})
+            self.assertEqual(model.calls, 0)
+        finally:
+            connection.close()
+
+        status_connection = self.connection(server)
+        try:
+            status_connection.request("GET", "/v1/requests/unknown-request")
+            status_response = status_connection.getresponse()
+            self.assertEqual(status_response.status, 503)
+            self.assertEqual(json.loads(status_response.read())["error"]["category"], "dependency_unavailable")
+        finally:
+            status_connection.close()
+
+    def test_terminal_storage_failure_still_emits_one_failed_terminal_and_releases_request(self):
+        class FailingTerminalLedger(InMemoryRequestLedger):
+            def mark_terminal(self, request_id, outcome):
+                del request_id, outcome
+                raise RequestLedgerUnavailable()
+
+        gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), FailingTerminalLedger())
+        session = gateway.create_session()
+        events = list(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        self.assertEqual(events[-1].outcome, "failed")
+        self.assertEqual(sum(event.type == "terminal" for event in events), 1)
+        self.assertEqual(gateway._requests, {})
+        self.assertEqual(gateway.request_status(events[0].request_id)["state"], "in_progress")
+
+    def test_lifecycle_storage_failure_is_a_safe_http_dependency_error(self):
+        class FailingTerminalLedger(InMemoryRequestLedger):
+            def mark_terminal(self, request_id, outcome):
+                del request_id, outcome
+                raise RequestLedgerUnavailable()
+
+        server = self.with_server(FakeModel(delay_seconds=0.2), FailingTerminalLedger())
+        session = self.create_session(server)
+        connection, response = self.start_turn(server, str(session["session_id"]))
+        try:
+            self.assertEqual(self.read_frame(response)[0], "accepted")
+            reset_connection = self.connection(server)
+            try:
+                reset_connection.request("POST", f"/v1/sessions/{session['session_id']}/reset")
+                reset_response = reset_connection.getresponse()
+                self.assertEqual(reset_response.status, 503)
+                self.assertEqual(json.loads(reset_response.read())["error"]["category"], "dependency_unavailable")
+            finally:
+                reset_connection.close()
+        finally:
+            connection.close()
+
+    def test_restart_recovery_fails_admitted_request_without_rerunning_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            first_model = CountingModel()
+            first_ledger = SQLiteRequestLedger(path)
+            first = TextGateway(first_model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), first_ledger)
+            session = first.create_session()
+            pending = first.begin_turn(session.session_id, {"input": "hello"}, self.startup)
+            request_id = next(iter(pending)).request_id
+            self.assertEqual(first_model.calls, 0)
+            first_ledger.close()
+
+            recovered_model = CountingModel()
+            recovered_ledger = SQLiteRequestLedger(path)
+            self.addCleanup(recovered_ledger.close)
+            recovered = TextGateway(recovered_model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), recovered_ledger)
+            recovered.recover_interrupted_requests()
+            status = recovered.request_status(request_id)
+            self.assertEqual((status["state"], status["outcome"]), ("terminal", "failed"))
+            self.assertEqual(recovered_model.calls, 0)
 
     def test_explicit_fixture_outcomes_have_one_terminal_and_safe_error(self):
         outcomes = {
@@ -287,6 +397,18 @@ class StreamingHttpTests(unittest.TestCase):
         terminal = self.status(server, str(accepted["request_id"]))
         self.assertEqual(terminal["state"], "terminal")
         self.assertEqual(terminal["outcome"], "completed")
+        self.assertEqual(model.calls, 1)
+
+    def test_disconnect_before_acceptance_has_no_automatic_replay(self):
+        model = CountingModel(chunks=("one", "two"), delay_seconds=0.05)
+        server = self.with_server(model)
+        session = self.create_session(server)
+        connection, response = self.start_turn(server, str(session["session_id"]))
+        self.assertEqual(response.status, 200)
+        connection.close()
+
+        time.sleep(0.2)
+
         self.assertEqual(model.calls, 1)
 
     def test_reset_and_end_routes_only_translate_lifecycle_outcomes(self):

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Iterator, Mapping
 
-from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
@@ -20,6 +21,7 @@ MAX_OPEN_SESSIONS = 10
 MAX_ACTIVE_TURNS = 2
 IDLE_SESSION_SECONDS = 30 * 60
 MAX_SESSION_SECONDS = 24 * 60 * 60
+REQUEST_RETENTION_SECONDS = 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,7 @@ class _Request:
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -98,6 +100,7 @@ class TextGateway:
         self._tools = tools
         self._identifiers = identifiers
         self._synchronization = synchronization
+        self._ledger = ledger
         self._sessions: dict[str, Session] = {}
         self._requests: dict[str, _Request] = {}
 
@@ -144,6 +147,22 @@ class TextGateway:
             _validate_transcript_capacity(model_input.messages)
             session.last_active_at = self._monotonic()
             request = _Request(self._identifiers.next_id("request"), session.session_id, self._identifiers.next_id("trace"), session.context_generation)
+            admitted_at = self._clock.now()
+            try:
+                self._ledger.reserve(
+                    RequestStatusRecord(
+                        request.request_id,
+                        request.session_id,
+                        request.trace_id,
+                        request.context_generation,
+                        "in_progress",
+                        None,
+                        admitted_at,
+                        _request_expiry(admitted_at),
+                    )
+                )
+            except RequestLedgerUnavailable:
+                raise AdmissionError(503, "request_ledger_unavailable", "dependency_unavailable", "Request status storage is unavailable.", True) from None
             self._requests[request.request_id] = request
         return self._stream(request, model_input, text, supplied_context)
 
@@ -153,7 +172,10 @@ class TextGateway:
             session = self._sessions.get(session_id)
             if session is None:
                 raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
-            self._cancel_generation_locked(session_id, session.context_generation)
+            try:
+                self._cancel_generation_locked(session_id, session.context_generation)
+            except RequestLedgerUnavailable:
+                raise _ledger_unavailable_error() from None
             session.context_generation += 1
             session.transcript = ()
             session.last_active_at = self._monotonic()
@@ -165,7 +187,10 @@ class TextGateway:
             session = self._sessions.get(session_id)
             if session is None:
                 raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
-            self._cancel_generation_locked(session_id, session.context_generation)
+            try:
+                self._cancel_generation_locked(session_id, session.context_generation)
+            except RequestLedgerUnavailable:
+                raise _ledger_unavailable_error() from None
             del self._sessions[session_id]
 
     def expire_sessions(self) -> None:
@@ -173,14 +198,20 @@ class TextGateway:
             self._expire_sessions_locked()
 
     def request_status(self, request_id: str) -> dict[str, object]:
-        with self._synchronization.locked():
-            request = self._requests.get(request_id)
-            if request is None:
-                return {"request_id": request_id, "state": "unavailable"}
-            payload: dict[str, object] = {"request_id": request.request_id, "session_id": request.session_id, "trace_id": request.trace_id, "context_generation": request.context_generation, "state": "terminal" if request.outcome is not None else "in_progress"}
-            if request.outcome is not None:
-                payload["outcome"] = request.outcome
-            return payload
+        try:
+            record = self._ledger.lookup(request_id, self._clock.now())
+        except RequestLedgerUnavailable:
+            raise _ledger_unavailable_error() from None
+        if record is None:
+            return {"request_id": request_id, "state": "unavailable"}
+        payload: dict[str, object] = {"request_id": record.request_id, "session_id": record.session_id, "trace_id": record.trace_id, "context_generation": record.context_generation, "state": record.state}
+        if record.outcome is not None:
+            payload["outcome"] = record.outcome
+        return payload
+
+    def recover_interrupted_requests(self) -> None:
+        """Fail admitted work from an earlier process without replaying it."""
+        self._ledger.recover_interrupted()
 
     def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...]) -> Iterator[StreamEvent]:
         yield self._event(request, "accepted")
@@ -282,9 +313,15 @@ class TextGateway:
             session = self._sessions.get(request.session_id)
             if request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
                 outcome = "cancelled"
+            try:
+                self._ledger.mark_terminal(request.request_id, outcome)
+            except RequestLedgerUnavailable:
+                outcome = "failed"
             request.terminal_emitted = True
             request.outcome = outcome
-            return self._event(request, "terminal", outcome=outcome)
+            event = self._event(request, "terminal", outcome=outcome)
+            self._requests.pop(request.request_id, None)
+            return event
 
     def _content_delta(self, request: _Request, content: str) -> StreamEvent | None:
         with self._synchronization.locked():
@@ -332,6 +369,7 @@ class TextGateway:
     def _cancel_generation_locked(self, session_id: str, generation: int) -> None:
         for request in self._requests.values():
             if request.session_id == session_id and request.context_generation == generation and request.outcome is None:
+                self._ledger.mark_terminal(request.request_id, "cancelled")
                 request.outcome = "cancelled"
 
     def _monotonic(self) -> float:
@@ -347,6 +385,21 @@ def _utf8_length(value: object) -> int | None:
         return len(value.encode("utf-8"))
     except UnicodeError:
         return None
+
+
+def _request_expiry(admitted_at: str) -> str:
+    """Return the fixed 24-hour retention expiry for a UTC clock timestamp."""
+    try:
+        parsed = datetime.fromisoformat(admitted_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise RequestLedgerUnavailable() from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed.astimezone(timezone.utc) + timedelta(seconds=REQUEST_RETENTION_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ledger_unavailable_error() -> AdmissionError:
+    return AdmissionError(503, "request_ledger_unavailable", "dependency_unavailable", "Request status storage is unavailable.", True)
 
 
 def _validate_turn_document(document: object) -> tuple[str, tuple[ModelMessage, ...]]:

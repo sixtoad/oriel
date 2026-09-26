@@ -4,7 +4,7 @@ import unittest
 from threading import Event
 from unittest.mock import patch
 
-from oriel.adapters.bootstrap import AdvanceableClock, CleanupTrigger, DisabledTools, NoopTelemetry, RecordingModel, RuntimeClock, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import AdvanceableClock, CleanupTrigger, DisabledTools, InMemoryRequestLedger, NoopTelemetry, RecordingModel, RuntimeClock, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.application.ports import ModelMessage
 from oriel.application.text_gateway import AdmissionError, IDLE_SESSION_SECONDS, MAX_SESSION_SECONDS, TextGateway
 from oriel.application.startup import StartupState
@@ -18,7 +18,7 @@ class SessionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = AdvanceableClock()
         self.model = RecordingModel(response="reply")
-        self.gateway = TextGateway(self.model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+        self.gateway = TextGateway(self.model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
 
     def stream(self, session_id: str, document: object) -> list[object]:
         return list(self.gateway.begin_turn(session_id, document, READY))
@@ -55,7 +55,7 @@ class SessionTests(unittest.TestCase):
             with self.subTest(transition=transition):
                 clock = AdvanceableClock()
                 model = RecordingModel(response="reply")
-                gateway = TextGateway(model, clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+                gateway = TextGateway(model, clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
                 session = gateway.create_session()
                 events = iter(gateway.begin_turn(session.session_id, {"input": "slow"}, READY))
                 accepted = next(events)
@@ -91,7 +91,7 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(AdmissionError) as expired:
             self.gateway.begin_turn(session.session_id, {"input": "again"}, READY)
         self.assertEqual(expired.exception.status, 404)
-        fresh = TextGateway(self.model, AdvanceableClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+        fresh = TextGateway(self.model, AdvanceableClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
         with self.assertRaises(AdmissionError) as missing:
             fresh.begin_turn(session.session_id, {"input": "again"}, READY)
         self.assertEqual(missing.exception.status, 404)
@@ -117,7 +117,7 @@ class SessionTests(unittest.TestCase):
 
     def test_near_limit_response_fails_without_replacing_prior_transcript(self) -> None:
         model = RecordingModel(response="r" * 2000)
-        gateway = TextGateway(model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+        gateway = TextGateway(model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
         session = gateway.create_session()
         prior = tuple(ModelMessage("user" if index % 2 == 0 else "assistant", "x" * 2100) for index in range(30))
         gateway._sessions[session.session_id].transcript = prior

@@ -68,8 +68,12 @@ cleans up sessions after 30 minutes idle or 24 hours total lifetime.
 
 The stream starts with `accepted`, emits ordered `content_delta` events, and
 ends with one `terminal` event. Status lookup is passive and never replays a
-turn. The bootstrap uses the packaged non-secret fixture, makes no provider or
-Home Assistant call, and stores nothing persistently.
+turn. Session context remains volatile. The runtime stores only request
+correlation metadata and terminal outcomes in a local owner-only SQLite ledger
+for 24 hours; it never stores prompts, context, model output, credentials, or
+action material. Its path defaults to `oriel-request-ledger.sqlite3` and can be
+selected with `python3 -m oriel --ledger /path/to/ledger.sqlite3`. The bootstrap
+uses the packaged non-secret fixture and makes no provider or Home Assistant call.
 
 ## Configuration activation
 

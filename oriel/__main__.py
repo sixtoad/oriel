@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from http.client import HTTPConnection
 from typing import Mapping
 
-from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
 from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, activate_startup, provider_profile_resolver
 from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
+from .adapters.request_ledger import SQLiteRequestLedger
 from .application.configuration import ConfigurationService
+from .application.ports import RequestLedgerUnavailable
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION
 
@@ -52,7 +55,7 @@ def _model_for_profile(profile: object, environ: Mapping[str, str] | None = None
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
     startup, _profile = _compose_startup(config_path)
-    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
     server = HealthServer(startup, core)
     server.start()
     try:
@@ -72,12 +75,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--ledger", type=Path, default=Path("oriel-request-ledger.sqlite3"), help="Path to the local durable request-status ledger")
     args = parser.parse_args(argv)
     if args.self_test:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
     startup, _profile = _compose_startup(args.config)
-    gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
+    try:
+        ledger = SQLiteRequestLedger(args.ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
+        gateway.recover_interrupted_requests()
+    except RequestLedgerUnavailable:
+        ledger = UnavailableRequestLedger()
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()
@@ -88,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         cleanup.close()
         server.close()
+        if isinstance(ledger, SQLiteRequestLedger):
+            ledger.close()
     return 0
 
 

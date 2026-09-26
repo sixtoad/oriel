@@ -29,6 +29,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '429': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /v1/sessions/{session_id}/reset:
     post:
       parameters: [{$ref: '#/components/parameters/SessionId'}]
@@ -55,6 +56,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/RequestId'}]
       responses:
         '200': {description: Passive request status; it never starts or replays work, content: {application/json: {schema: {$ref: './schemas/request-status.json'}}}}
+        '503': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
 components:
   parameters:
