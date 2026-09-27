@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import unittest
-from threading import Event
+import time
+from threading import Event, Thread
 from unittest.mock import patch
 
 from oriel.adapters.bootstrap import AdvanceableClock, CleanupTrigger, DisabledTools, InMemoryRequestLedger, NoopTelemetry, RecordingModel, RuntimeClock, SequentialIds, ThreadSafeSynchronization, VolatileState
-from oriel.application.ports import ModelMessage
+from oriel.application.ports import ModelChunk, ModelMessage, ModelProposal
 from oriel.application.text_gateway import AdmissionError, IDLE_SESSION_SECONDS, MAX_SESSION_SECONDS, TextGateway
 from oriel.application.startup import StartupState
 from oriel.domain.configuration import parse_core_config
@@ -67,7 +68,7 @@ class SessionTests(unittest.TestCase):
                 else:
                     clock.advance(MAX_SESSION_SECONDS)
                     gateway.expire_sessions()
-                self.assertEqual(gateway.request_status(accepted.request_id)["outcome"], "cancelled")
+                self.assertEqual(gateway.request_status(accepted.request_id)["state"], "in_progress")
                 if transition == "reset":
                     self.assertEqual(model.inputs, [])
                     replacement = list(gateway.begin_turn(session.session_id, {"input": "again"}, READY))
@@ -83,6 +84,72 @@ class SessionTests(unittest.TestCase):
                     with self.assertRaises(AdmissionError) as unavailable:
                         gateway.begin_turn(session.session_id, {"input": "again"}, READY)
                     self.assertEqual(unavailable.exception.status, 404)
+
+    def test_explicit_cancel_is_idempotent_and_discards_late_content_and_proposals(self) -> None:
+        class LateOutputModel:
+            def __init__(self, late_item: ModelChunk | ModelProposal) -> None:
+                self.waiting = Event()
+                self.release = Event()
+                self.cancelled = Event()
+                self.late_item = late_item
+
+            def respond(self, text: str) -> str:
+                del text
+                return "unused"
+
+            def stream(self, input, cancellation):
+                del input
+                yield ModelChunk("early")
+                self.waiting.set()
+                self.release.wait(1)
+                if cancellation.is_cancelled():
+                    self.cancelled.set()
+                yield self.late_item
+
+        late_items = (
+            ModelChunk("late"),
+            ModelProposal({
+                "proposal_version": "1.0", "proposal_id": "late", "action": "sample_action",
+                "target": "synthetic:sample-target", "arguments": {"values": ["sample"]},
+                "dry_run": True, "idempotency": "late", "deadline": "2030-01-02T12:34:00Z",
+                "confirmation": {"required": True, "evidence": None},
+            }),
+        )
+        for late_item in late_items:
+            with self.subTest(late_item=type(late_item).__name__):
+                model = LateOutputModel(late_item)
+                gateway = TextGateway(model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+                session = gateway.create_session()
+                events = iter(gateway.begin_turn(session.session_id, {"input": "slow"}, READY))
+                accepted = next(events)
+                self.assertEqual(next(events).type, "content_delta")
+
+                received: list[object] = []
+                worker = Thread(target=lambda: received.extend(events), daemon=True)
+                worker.start()
+                self.assertTrue(model.waiting.wait(1))
+                started = time.monotonic()
+                acknowledgement = gateway.cancel_request(accepted.request_id)
+                self.assertEqual(acknowledgement, {"request_id": accepted.request_id, "state": "cancellation_requested"})
+                self.assertEqual(gateway.cancel_request(accepted.request_id), acknowledgement)
+                model.release.set()
+                worker.join(1)
+                self.assertFalse(worker.is_alive())
+                self.assertLess(time.monotonic() - started, 0.25)
+                self.assertTrue(model.cancelled.is_set())
+                self.assertEqual([event.type for event in received], ["terminal"])
+                self.assertEqual(received[0].outcome, "cancelled")
+                self.assertEqual(gateway.request_status(accepted.request_id)["outcome"], "cancelled")
+                self.assertEqual(gateway._sessions[session.session_id].transcript, ())
+
+    def test_cancel_after_completion_and_unknown_request_are_safe(self) -> None:
+        session = self.gateway.create_session()
+        events = self.stream(session.session_id, {"input": "done"})
+        request_id = events[0].request_id
+        self.assertEqual(self.gateway.cancel_request(request_id), {"request_id": request_id, "state": "already_terminal", "outcome": "completed"})
+        with self.assertRaises(AdmissionError) as missing:
+            self.gateway.cancel_request("unknown-request")
+        self.assertEqual((missing.exception.status, missing.exception.category), (404, "conflict_or_expired_reference"))
 
     def test_expiry_has_idle_and_absolute_lifetime_bounds_and_fresh_gateway_has_no_state(self) -> None:
         session = self.gateway.create_session()

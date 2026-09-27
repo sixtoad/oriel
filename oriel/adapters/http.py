@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import select
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, Iterable
 
 from ..application.startup import StartupState
@@ -79,6 +81,18 @@ def _handler(startup: StartupState, gateway: TextGateway | None) -> type[BaseHTT
                 except AdmissionError as failure:
                     self._send_admission_error(failure)
                 return
+            request_prefix = "/v1/requests/"
+            cancel_suffix = "/cancel"
+            if self.path.startswith(request_prefix) and self.path.endswith(cancel_suffix):
+                request_id = self.path[len(request_prefix) : -len(cancel_suffix)]
+                if not _opaque_path_id(request_id):
+                    self._send_admission_error(AdmissionError(404, "request_unavailable", "conflict_or_expired_reference", "Request is unavailable."))
+                    return
+                try:
+                    self._send_json(202, gateway.cancel_request(request_id))
+                except AdmissionError as failure:
+                    self._send_admission_error(failure)
+                return
             prefix = "/v1/sessions/"
             reset_suffix = "/reset"
             if self.path.startswith(prefix) and self.path.endswith(reset_suffix):
@@ -145,14 +159,46 @@ def _handler(startup: StartupState, gateway: TextGateway | None) -> type[BaseHTT
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             disconnected = False
-            for event in events:
-                if disconnected:
-                    continue
-                try:
-                    self._send_frame(event)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    disconnected = True
+            watcher_stop = Event()
+            watcher: Thread | None = None
+            try:
+                for event in events:
+                    if disconnected:
+                        continue
+                    try:
+                        gateway.deliver_stream_event(event, self._send_frame)
+                        if event.type == "accepted":
+                            watcher = Thread(target=self._watch_disconnect, args=(event.request_id, watcher_stop), daemon=True)
+                            watcher.start()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        disconnected = True
+                        self._request_cancellation(event.request_id)
+            finally:
+                watcher_stop.set()
+                if watcher is not None:
+                    watcher.join(timeout=0.1)
             self.close_connection = True
+
+        def _watch_disconnect(self, request_id: str, stop: Event) -> None:
+            while not stop.is_set():
+                try:
+                    readable, _writable, _errors = select.select([self.connection], [], [], 0.05)
+                    if not readable:
+                        continue
+                    if self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b"":
+                        self._request_cancellation(request_id)
+                        return
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    self._request_cancellation(request_id)
+                    return
+
+        def _request_cancellation(self, request_id: str) -> None:
+            try:
+                gateway.cancel_request(request_id)
+            except AdmissionError:
+                pass
 
         def _send_frame(self, event: StreamEvent) -> None:
             frame = b"event: " + event.type.encode("ascii") + b"\n" + b"data: " + _canonical_json(event.payload()) + b"\n\n"

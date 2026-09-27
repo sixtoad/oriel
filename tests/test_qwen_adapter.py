@@ -12,7 +12,8 @@ import unittest
 from oriel.adapters.bootstrap import FixedClock, InMemoryRequestLedger, NoopTelemetry, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, provider_profile_resolver
 from oriel.adapters.http import HealthServer
-from oriel.adapters.qwen import OpenAICompatibleStreamingModel
+from oriel.adapters.qwen import OpenAICompatibleStreamingModel, _decode_openai_sse
+from oriel.application.ports import CancellationSignal
 from oriel.application.startup import StartupState
 from oriel.application.text_gateway import TextGateway
 from oriel.domain.configuration import parse_core_config
@@ -248,6 +249,27 @@ class QwenAdapterTests(unittest.TestCase):
             }}}), encoding="utf-8")
             with self.assertRaises(ProfileUnavailable):
                 provider_profile_resolver({"ORIEL_PROVIDER_PROFILES_PATH": str(registry)})
+
+    def test_cancellation_signal_stops_decoding_without_a_provider_outcome(self) -> None:
+        cancellation = CancellationSignal()
+        cancellation.cancel()
+        self.assertEqual(list(_decode_openai_sse(["[DONE]"], cancellation)), [])
+
+    def test_cancellation_between_records_stops_decoding_before_provider_completion(self) -> None:
+        cancellation = CancellationSignal()
+        first = json.dumps({"choices": [{"delta": {"content": "early"}, "finish_reason": None}]}, separators=(",", ":"))
+
+        def records():
+            yield first
+            if cancellation.is_cancelled():
+                raise AssertionError("decoder read a provider record after cancellation")
+            yield json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}, separators=(",", ":"))
+            yield "[DONE]"
+
+        decoded = _decode_openai_sse(records(), cancellation)
+        self.assertEqual(next(decoded).content, "early")
+        cancellation.cancel()
+        self.assertEqual(list(decoded), [])
 
 
 if __name__ == "__main__":

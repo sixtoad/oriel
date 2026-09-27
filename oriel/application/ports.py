@@ -50,10 +50,23 @@ class ModelInput:
     messages: tuple[ModelMessage, ...]
 
 
+@dataclass
+class CancellationSignal:
+    """Application-owned cooperative cancellation intent for one live turn."""
+
+    _cancelled: bool = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+
 class StreamingModelPort(Protocol):
     """Produces bounded text pieces and one explicit outcome for an admitted turn."""
 
-    def stream(self, input: ModelInput) -> Iterable[ModelStreamItem]: ...
+    def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]: ...
 
 
 class IdentifierPort(Protocol):

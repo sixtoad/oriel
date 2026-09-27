@@ -48,9 +48,9 @@ paths:
     post:
       parameters: [{$ref: '#/components/parameters/RequestId'}]
       responses:
-        '202': {description: Cancellation acknowledgement; a terminal race reports already_terminal and its outcome, content: {application/json: {schema: {$ref: './schemas/cancellation.json'}}}}
+        '202': {description: Cancellation acknowledgement; repeat live cancellation remains cancellation_requested, and a terminal race reports already_terminal with its outcome, content: {application/json: {schema: {$ref: './schemas/cancellation.json'}}}}
         '404': {$ref: '#/components/responses/Error'}
-        '409': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /v1/requests/{request_id}:
     get:
       parameters: [{$ref: '#/components/parameters/RequestId'}]

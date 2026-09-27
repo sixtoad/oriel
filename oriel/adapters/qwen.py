@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ..application.ports import ModelChunk, ModelInput, ModelOutcome, ModelProposal, ModelStreamItem
+from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelProposal, ModelStreamItem
 from ..domain.proposals import validate_proposal
 from .configuration import OpenAICompatibleProfile
 
@@ -61,7 +61,9 @@ class OpenAICompatibleStreamingModel:
     credentials: CredentialResolver | None = None
     opener: Callable[..., Any] = _open_pinned
 
-    def stream(self, input: ModelInput) -> Iterable[ModelStreamItem]:
+    def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]:
+        if cancellation.is_cancelled():
+            return
         request = self._request(input)
         try:
             response = self.opener(request, timeout=MODEL_DEADLINE_SECONDS)
@@ -70,7 +72,7 @@ class OpenAICompatibleStreamingModel:
                 content_type = response.headers.get_content_type() if hasattr(response.headers, "get_content_type") else response.headers.get("Content-Type", "").split(";", 1)[0]
                 if type(status) is not int or not isinstance(content_type, str) or status < 200 or status >= 300 or content_type.lower() != "text/event-stream":
                     raise ProviderStreamFailure("worker response unavailable")
-                yield from _decode_openai_sse(_iter_sse_records(response))
+                yield from _decode_openai_sse(_iter_sse_records(response, cancellation), cancellation)
         except (HTTPError, URLError, OSError, UnicodeError, ValueError, ProviderStreamFailure):
             raise ProviderStreamFailure("worker stream unavailable") from None
 
@@ -89,11 +91,11 @@ class OpenAICompatibleStreamingModel:
         return Request(self.profile.request_url, data=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), headers=headers, method="POST")
 
 
-def _iter_sse_records(response: Any) -> Iterator[str]:
+def _iter_sse_records(response: Any, cancellation: CancellationSignal) -> Iterator[str]:
     """Decode one bounded UTF-8 SSE record at a time from arbitrary byte chunks."""
     data_lines: list[bytes] = []
     record_bytes = 0
-    while raw_line := response.readline(MAX_PROVIDER_RECORD_BYTES + 1):
+    while not cancellation.is_cancelled() and (raw_line := response.readline(MAX_PROVIDER_RECORD_BYTES + 1)):
         if len(raw_line) > MAX_PROVIDER_RECORD_BYTES or not raw_line.endswith(b"\n"):
             raise ProviderStreamFailure("oversized worker record")
         line = raw_line[:-1].rstrip(b"\r")
@@ -120,16 +122,25 @@ def _iter_sse_records(response: Any) -> Iterator[str]:
         raise ProviderStreamFailure("unterminated worker SSE")
 
 
-def _decode_openai_sse(records: Iterable[str]) -> Iterator[ModelStreamItem]:
+def _decode_openai_sse(records: Iterable[str], cancellation: CancellationSignal) -> Iterator[ModelStreamItem]:
     decoder = _OpenAIStreamDecoder()
-    for record in records:
+    iterator = iter(records)
+    while not cancellation.is_cancelled():
+        try:
+            record = next(iterator)
+        except StopIteration:
+            break
         if record == "[DONE]":
             terminal = decoder.finish()
             yield from decoder.drain()
             yield terminal
             return
         decoder.accept(record)
+        if cancellation.is_cancelled():
+            return
         yield from decoder.drain()
+    if cancellation.is_cancelled():
+        return
     raise ProviderStreamFailure("worker stream ended early")
 
 

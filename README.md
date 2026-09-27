@@ -57,6 +57,7 @@ another terminal create a session and submit a turn:
 curl -s -X POST http://127.0.0.1:8080/v1/sessions
 curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
   -H 'content-type: application/json' --data '{"input":"hello"}'
+curl -s -X POST http://127.0.0.1:8080/v1/requests/<request_id>/cancel
 curl -s http://127.0.0.1:8080/v1/requests/<request_id>
 ```
 
@@ -67,8 +68,13 @@ generation, or remove it with `DELETE /v1/sessions/<session_id>`. The runtime
 cleans up sessions after 30 minutes idle or 24 hours total lifetime.
 
 The stream starts with `accepted`, emits ordered `content_delta` events, and
-ends with one `terminal` event. Status lookup is passive and never replays a
-turn. Session context remains volatile. The runtime stores only request
+ends with one `terminal` event. Cancelling a live request returns
+`cancellation_requested`; a repeated request is safe, and a completed race
+returns `already_terminal` with its outcome. A disconnected stream is
+cancelled. Status lookup is passive and is the reconnect path; it never
+replays a turn. Cancellation asks a local upstream to stop cooperatively, but
+the gateway still discards late upstream output if it cannot be interrupted
+immediately. Session context remains volatile. The runtime stores only request
 correlation metadata and terminal outcomes in a local owner-only SQLite ledger
 for 24 hours; it never stores prompts, context, model output, credentials, or
 action material. Its path defaults to `oriel-request-ledger.sqlite3` and can be

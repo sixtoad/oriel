@@ -4,8 +4,11 @@ from http.client import HTTPConnection
 import json
 from pathlib import Path
 import re
+import socket
+import struct
 import tempfile
 import time
+from threading import Event, Thread
 import unittest
 
 from oriel.adapters.bootstrap import DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
@@ -13,8 +16,8 @@ from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileR
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
-from oriel.application.ports import ModelChunk, RequestLedgerUnavailable
-from oriel.application.text_gateway import TextGateway
+from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, RequestLedgerUnavailable
+from oriel.application.text_gateway import AdmissionError, TextGateway
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -23,20 +26,20 @@ VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skill
 class CountingModel(FakeModel):
     calls: int = 0
 
-    def stream(self, text: str):
+    def stream(self, input: ModelInput, cancellation: CancellationSignal):
         self.calls += 1
-        yield from super().stream(text)
+        yield from super().stream(input, cancellation)
 
 
 class MissingOutcomeModel(FakeModel):
-    def stream(self, text: str):
-        del text
+    def stream(self, input: ModelInput, cancellation: CancellationSignal):
+        del input, cancellation
         yield ModelChunk("ordinary prose")
 
 
 class ExplodingModel(FakeModel):
-    def stream(self, text: str):
-        del text
+    def stream(self, input: ModelInput, cancellation: CancellationSignal):
+        del input, cancellation
         raise RuntimeError("private provider detail")
         yield ModelChunk("")
 
@@ -106,6 +109,11 @@ class StreamingHttpTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def cancel(self, server: HealthServer, request_id: str):
+        connection = self.connection(server)
+        connection.request("POST", f"/v1/requests/{request_id}/cancel")
+        return connection, connection.getresponse()
+
     def test_delayed_stream_is_ordered_and_status_is_passive(self):
         model = CountingModel(chunks=("hello", " world"), delay_seconds=0.15)
         server = self.with_server(model)
@@ -158,6 +166,77 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(model.calls, 1)
         self.assertEqual(gateway.request_status(accepted.request_id)["state"], "terminal")
 
+    def test_cancelled_turn_keeps_capacity_until_terminal_but_reset_allows_a_new_generation(self):
+        gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        first = gateway.create_session()
+        second = gateway.create_session()
+        first_events = iter(gateway.begin_turn(first.session_id, {"input": "first"}, self.startup))
+        first_request = next(first_events).request_id
+        self.assertEqual(gateway.cancel_request(first_request)["state"], "cancellation_requested")
+        gateway.reset_session(first.session_id)
+        replacement = iter(gateway.begin_turn(first.session_id, {"input": "replacement"}, self.startup))
+        self.assertEqual(next(replacement).context_generation, 1)
+        with self.assertRaises(AdmissionError) as capacity:
+            gateway.begin_turn(second.session_id, {"input": "blocked"}, self.startup)
+        self.assertEqual(capacity.exception.status, 429)
+
+    def test_completion_wins_before_cancellation_without_leaving_cancelled_context(self):
+        class BlockingTerminalLedger(InMemoryRequestLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = Event()
+                self.release = Event()
+
+            def mark_terminal(self, request_id, outcome):
+                self.entered.set()
+                self.release.wait(1)
+                super().mark_terminal(request_id, outcome)
+
+        ledger = BlockingTerminalLedger()
+        gateway = TextGateway(FakeModel(response="reply"), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger)
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        request_id = next(events).request_id
+        received: list[object] = []
+        stream_thread = Thread(target=lambda: received.extend(events), daemon=True)
+        stream_thread.start()
+        self.assertTrue(ledger.entered.wait(1))
+        acknowledgement: list[dict[str, object]] = []
+        cancel_thread = Thread(target=lambda: acknowledgement.append(gateway.cancel_request(request_id)), daemon=True)
+        cancel_thread.start()
+        time.sleep(0.03)
+        self.assertEqual(acknowledgement, [])
+        ledger.release.set()
+        stream_thread.join(1)
+        cancel_thread.join(1)
+        self.assertEqual(received[-1].outcome, "completed")
+        self.assertEqual(acknowledgement, [{"request_id": request_id, "state": "already_terminal", "outcome": "completed"}])
+        self.assertEqual([(message.role, message.content) for message in gateway._sessions[session.session_id].transcript], [("user", "hello"), ("assistant", "reply")])
+
+    def test_delivery_serializes_an_existing_content_event_with_cancellation(self):
+        gateway = TextGateway(FakeModel(response="reply"), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        request_id = next(events).request_id
+        content = next(events)
+        entered = Event()
+        release = Event()
+        delivered: list[object] = []
+        delivery_thread = Thread(target=lambda: gateway.deliver_stream_event(content, lambda event: (entered.set(), release.wait(1), delivered.append(event))), daemon=True)
+        delivery_thread.start()
+        self.assertTrue(entered.wait(1))
+        acknowledgement: list[dict[str, object]] = []
+        cancel_thread = Thread(target=lambda: acknowledgement.append(gateway.cancel_request(request_id)), daemon=True)
+        cancel_thread.start()
+        time.sleep(0.03)
+        self.assertEqual(acknowledgement, [])
+        release.set()
+        delivery_thread.join(1)
+        cancel_thread.join(1)
+        self.assertEqual(delivered, [content])
+        self.assertEqual(acknowledgement, [{"request_id": request_id, "state": "cancellation_requested"}])
+        self.assertEqual([event.type for event in events], ["terminal"])
+
     def test_ledger_reservation_failure_returns_safe_http_error_without_model_work(self):
         class UnavailableLedger:
             def reserve(self, record):
@@ -209,7 +288,7 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(gateway._requests, {})
         self.assertEqual(gateway.request_status(events[0].request_id)["state"], "in_progress")
 
-    def test_lifecycle_storage_failure_is_a_safe_http_dependency_error(self):
+    def test_lifecycle_cancellation_leaves_terminal_storage_to_the_stream_owner(self):
         class FailingTerminalLedger(InMemoryRequestLedger):
             def mark_terminal(self, request_id, outcome):
                 del request_id, outcome
@@ -224,10 +303,12 @@ class StreamingHttpTests(unittest.TestCase):
             try:
                 reset_connection.request("POST", f"/v1/sessions/{session['session_id']}/reset")
                 reset_response = reset_connection.getresponse()
-                self.assertEqual(reset_response.status, 503)
-                self.assertEqual(json.loads(reset_response.read())["error"]["category"], "dependency_unavailable")
+                self.assertEqual(reset_response.status, 200)
+                reset_response.read()
             finally:
                 reset_connection.close()
+            terminal = self.read_frame(response)
+            self.assertEqual((terminal[0], terminal[1]["outcome"]), ("terminal", "failed"))
         finally:
             connection.close()
 
@@ -385,19 +466,99 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"oriel-request-[A-Za-z0-9_-]{32}", value) for value in values))
         self.assertTrue(all("fake-request" not in value for value in values))
 
-    def test_disconnect_leaves_queryable_terminal_status_without_a_second_invocation(self):
-        model = CountingModel(chunks=("one", "two"), delay_seconds=0.05)
+    def test_disconnect_cancels_the_request_without_a_second_invocation(self):
+        model = CountingModel(chunks=("one",) * 20, delay_seconds=0.05)
         server = self.with_server(model)
         session = self.create_session(server)
         connection, response = self.start_turn(server, str(session["session_id"]))
         event_type, accepted = self.read_frame(response)
         self.assertEqual(event_type, "accepted")
+        stream_socket = response.fp.raw._sock
+        stream_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        response.close()
         connection.close()
-        time.sleep(0.2)
+        time.sleep(0.3)
         terminal = self.status(server, str(accepted["request_id"]))
         self.assertEqual(terminal["state"], "terminal")
-        self.assertEqual(terminal["outcome"], "completed")
+        self.assertEqual(terminal["outcome"], "cancelled")
         self.assertEqual(model.calls, 1)
+
+    def test_disconnect_during_silent_provider_work_cancels_before_completed_outcome(self):
+        class SilentOutcomeModel(FakeModel):
+            def stream(self, input: ModelInput, cancellation: CancellationSignal):
+                del input, cancellation
+                time.sleep(0.25)
+                yield ModelOutcome("completed")
+
+        server = self.with_server(SilentOutcomeModel())
+        session = self.create_session(server)
+        connection, response = self.start_turn(server, str(session["session_id"]))
+        accepted = self.read_frame(response)[1]
+        stream_socket = response.fp.raw._sock
+        stream_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        response.close()
+        connection.close()
+        time.sleep(0.4)
+        terminal = self.status(server, str(accepted["request_id"]))
+        self.assertEqual((terminal["state"], terminal["outcome"]), ("terminal", "cancelled"))
+
+    def test_cancel_route_acknowledges_live_terminal_and_unknown_requests(self):
+        server = self.with_server(FakeModel(chunks=("one", "two"), delay_seconds=0.2))
+        session = self.create_session(server)
+        stream_connection, stream = self.start_turn(server, str(session["session_id"]))
+        try:
+            accepted = self.read_frame(stream)[1]
+            cancel_connection, cancellation = self.cancel(server, str(accepted["request_id"]))
+            try:
+                self.assertEqual(cancellation.status, 202)
+                self.assertEqual(json.loads(cancellation.read()), {"request_id": accepted["request_id"], "state": "cancellation_requested"})
+            finally:
+                cancel_connection.close()
+            repeat_connection, repeated = self.cancel(server, str(accepted["request_id"]))
+            try:
+                self.assertEqual(repeated.status, 202)
+                self.assertEqual(json.loads(repeated.read()), {"request_id": accepted["request_id"], "state": "cancellation_requested"})
+            finally:
+                repeat_connection.close()
+            kind, terminal = self.read_frame(stream)
+            self.assertEqual(kind, "terminal")
+            self.assertEqual(terminal["outcome"], "cancelled")
+            self.assertEqual(terminal["type"], "terminal")
+            self.assertEqual(terminal["seq"], 2)
+            completed_connection, completed = self.cancel(server, str(accepted["request_id"]))
+            try:
+                self.assertEqual(completed.status, 202)
+                self.assertEqual(json.loads(completed.read()), {"request_id": accepted["request_id"], "state": "already_terminal", "outcome": "cancelled"})
+            finally:
+                completed_connection.close()
+        finally:
+            stream_connection.close()
+        unknown_connection, unknown = self.cancel(server, "unknown-request")
+        try:
+            self.assertEqual(unknown.status, 404)
+            self.assertEqual(json.loads(unknown.read())["error"]["category"], "conflict_or_expired_reference")
+        finally:
+            unknown_connection.close()
+        malformed_connection, malformed = self.cancel(server, "bad/request")
+        try:
+            self.assertEqual(malformed.status, 404)
+            self.assertEqual(json.loads(malformed.read()), {"error": {"code": "request_unavailable", "category": "conflict_or_expired_reference", "message": "Request is unavailable.", "retryable": False}})
+        finally:
+            malformed_connection.close()
+
+    def test_cancel_route_returns_a_safe_dependency_error_when_lookup_is_unavailable(self):
+        class LookupUnavailableLedger(InMemoryRequestLedger):
+            def lookup(self, request_id, now):
+                del request_id, now
+                raise RequestLedgerUnavailable()
+
+        server = self.with_server(FakeModel(), LookupUnavailableLedger())
+        connection, response = self.cancel(server, "unknown-request")
+        try:
+            self.assertEqual(response.status, 503)
+            self.assertEqual(json.loads(response.read()), {"error": {"code": "request_ledger_unavailable", "category": "dependency_unavailable", "message": "Request status storage is unavailable.", "retryable": True}})
+        finally:
+            connection.close()
 
     def test_disconnect_before_acceptance_has_no_automatic_replay(self):
         model = CountingModel(chunks=("one", "two"), delay_seconds=0.05)

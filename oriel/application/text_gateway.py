@@ -1,11 +1,11 @@
 """Application-owned text turns, volatile transcripts, and lifecycle fences."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
-from .ports import Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
@@ -87,6 +87,7 @@ class _Request:
     outcome: str | None = None
     seq: int = 0
     terminal_emitted: bool = False
+    cancellation: CancellationSignal = field(default_factory=CancellationSignal)
 
 
 class TextGateway:
@@ -137,7 +138,7 @@ class TextGateway:
                 raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
             if not startup.ready:
                 raise AdmissionError(409, "service_unready", "conflict_or_expired_reference", "Service is unavailable.", True)
-            if any(request.session_id == session_id and request.outcome is None for request in self._requests.values()):
+            if any(request.session_id == session_id and request.context_generation == session.context_generation and request.outcome is None for request in self._requests.values()):
                 raise AdmissionError(409, "turn_conflict", "conflict_or_expired_reference", "A turn is already active for this session.", True)
             if sum(request.outcome is None for request in self._requests.values()) >= MAX_ACTIVE_TURNS:
                 raise AdmissionError(429, "turn_capacity", "overload", "Turn capacity is reached.", True)
@@ -209,6 +210,31 @@ class TextGateway:
             payload["outcome"] = record.outcome
         return payload
 
+    def cancel_request(self, request_id: str) -> dict[str, object]:
+        """Request cooperative cancellation without assigning a terminal outcome."""
+        with self._synchronization.locked():
+            request = self._requests.get(request_id)
+            if request is not None and request.outcome is None:
+                request.cancellation.cancel()
+                return {"request_id": request_id, "state": "cancellation_requested"}
+            try:
+                record = self._ledger.lookup(request_id, self._clock.now())
+            except RequestLedgerUnavailable:
+                raise _ledger_unavailable_error() from None
+            if record is None or record.state != "terminal" or record.outcome is None:
+                raise AdmissionError(404, "request_unavailable", "conflict_or_expired_reference", "Request is unavailable.")
+            return {"request_id": request_id, "state": "already_terminal", "outcome": record.outcome}
+
+    def deliver_stream_event(self, event: StreamEvent, deliver: Callable[[StreamEvent], None]) -> bool:
+        """Serialize useful stream delivery with cancellation acknowledgement."""
+        with self._synchronization.locked():
+            if event.type in {"content_delta", "proposal"}:
+                request = self._requests.get(event.request_id)
+                if request is None or self._is_fenced_locked(request):
+                    return False
+            deliver(event)
+            return True
+
     def recover_interrupted_requests(self) -> None:
         """Fail admitted work from an earlier process without replaying it."""
         self._ledger.recover_interrupted()
@@ -229,7 +255,7 @@ class TextGateway:
             saw_proposal = False
             streamed_bytes = 0
             response_parts: list[str] = []
-            provider_stream = iter(model.stream(model_input))  # type: ignore[union-attr]
+            provider_stream = iter(model.stream(model_input, request.cancellation))  # type: ignore[union-attr]
             while True:
                 if self._is_fenced(request):
                     yield self._terminal(request, "cancelled")
@@ -237,7 +263,13 @@ class TextGateway:
                 try:
                     item = next(provider_stream)
                 except StopIteration:
+                    if self._is_fenced(request):
+                        yield self._terminal(request, "cancelled")
+                        return
                     break
+                if self._is_fenced(request):
+                    yield self._terminal(request, "cancelled")
+                    return
                 if isinstance(item, ModelChunk):
                     if saw_proposal:
                         yield self._error(request, "invalid_stream", "uncertainty", "Model output is unavailable.", False)
@@ -262,7 +294,11 @@ class TextGateway:
                         yield self._terminal(request, "outcome_unknown")
                         return
                     saw_proposal = True
-                    yield self._event(request, "proposal", proposal=item.proposal)
+                    proposal = self._proposal_event(request, item.proposal)
+                    if proposal is None:
+                        yield self._terminal(request, "cancelled")
+                        return
+                    yield proposal
                 elif isinstance(item, ModelOutcome):
                     if saw_outcome:
                         yield self._error(request, "invalid_outcome", "uncertainty", "Model outcome is unavailable.", False)
@@ -278,7 +314,7 @@ class TextGateway:
                         yield self._error(request, f"model_{item.outcome}", category, "Model did not complete the turn.", item.outcome == "failed")
                         yield self._terminal(request, item.outcome)
                         return
-                    record_result = self._record_completed_turn(request, text, supplied_context, "".join(response_parts))
+                    record_result, terminal = self._complete_turn(request, text, supplied_context, "".join(response_parts))
                     if record_result == "fenced":
                         yield self._terminal(request, "cancelled")
                         return
@@ -286,7 +322,9 @@ class TextGateway:
                         yield self._error(request, "transcript_limit", "internal_failure", "Response exceeded a context limit.", False)
                         yield self._terminal(request, "failed")
                         return
-                    yield self._terminal(request, "completed")
+                    if terminal is None:
+                        raise RuntimeError("completed turn is missing its terminal event")
+                    yield terminal
                     return
                 else:
                     yield self._error(request, "invalid_stream", "uncertainty", "Model output is unavailable.", False)
@@ -296,6 +334,9 @@ class TextGateway:
                 yield self._error(request, "missing_outcome", "uncertainty", "Model outcome is unavailable.", False)
                 yield self._terminal(request, "outcome_unknown")
         except Exception:
+            if self._is_fenced(request):
+                yield self._terminal(request, "cancelled")
+                return
             yield self._error(request, "model_failure", "internal_failure", "Model did not complete the turn.", True)
             yield self._terminal(request, "failed")
 
@@ -308,20 +349,23 @@ class TextGateway:
 
     def _terminal(self, request: _Request, outcome: str) -> StreamEvent:
         with self._synchronization.locked():
-            if request.terminal_emitted:
-                raise RuntimeError("terminal event already emitted")
-            session = self._sessions.get(request.session_id)
-            if request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
-                outcome = "cancelled"
-            try:
-                self._ledger.mark_terminal(request.request_id, outcome)
-            except RequestLedgerUnavailable:
-                outcome = "failed"
-            request.terminal_emitted = True
-            request.outcome = outcome
-            event = self._event(request, "terminal", outcome=outcome)
-            self._requests.pop(request.request_id, None)
-            return event
+            return self._terminal_locked(request, outcome)
+
+    def _terminal_locked(self, request: _Request, outcome: str) -> StreamEvent:
+        if request.terminal_emitted:
+            raise RuntimeError("terminal event already emitted")
+        session = self._sessions.get(request.session_id)
+        if request.cancellation.is_cancelled() or request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
+            outcome = "cancelled"
+        try:
+            self._ledger.mark_terminal(request.request_id, outcome)
+        except RequestLedgerUnavailable:
+            outcome = "failed"
+        request.terminal_emitted = True
+        request.outcome = outcome
+        event = self._event(request, "terminal", outcome=outcome)
+        self._requests.pop(request.request_id, None)
+        return event
 
     def _content_delta(self, request: _Request, content: str) -> StreamEvent | None:
         with self._synchronization.locked():
@@ -329,19 +373,25 @@ class TextGateway:
                 return None
             return self._event(request, "content_delta", content=content)
 
-    def _record_completed_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str) -> str:
+    def _proposal_event(self, request: _Request, proposal: Mapping[str, object]) -> StreamEvent | None:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
-                return "fenced"
+                return None
+            return self._event(request, "proposal", proposal=proposal)
+
+    def _complete_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str) -> tuple[str, StreamEvent | None]:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return "fenced", None
             session = self._sessions[request.session_id]
             updated = (*(session.transcript or supplied_context), ModelMessage("user", text), ModelMessage("assistant", response))
             try:
                 _validate_transcript_capacity(updated)
             except AdmissionError:
-                return "limit"
+                return "limit", None
             session.transcript = updated
             session.last_active_at = self._monotonic()
-            return "recorded"
+            return "recorded", self._terminal_locked(request, "completed")
 
     def _is_fenced(self, request: _Request) -> bool:
         with self._synchronization.locked():
@@ -349,7 +399,7 @@ class TextGateway:
 
     def _is_fenced_locked(self, request: _Request) -> bool:
         session = self._sessions.get(request.session_id)
-        return request.outcome == "cancelled" or session is None or session.context_generation != request.context_generation
+        return request.cancellation.is_cancelled() or request.outcome == "cancelled" or session is None or session.context_generation != request.context_generation
 
     def _expire_sessions_locked(self) -> None:
         now = self._monotonic()
@@ -369,8 +419,7 @@ class TextGateway:
     def _cancel_generation_locked(self, session_id: str, generation: int) -> None:
         for request in self._requests.values():
             if request.session_id == session_id and request.context_generation == generation and request.outcome is None:
-                self._ledger.mark_terminal(request.request_id, "cancelled")
-                request.outcome = "cancelled"
+                request.cancellation.cancel()
 
     def _monotonic(self) -> float:
         if not hasattr(self._clock, "monotonic"):

@@ -7,7 +7,7 @@ from threading import Event, RLock, Thread
 import time
 from typing import Callable, Iterable, Mapping
 
-from ..application.ports import ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
+from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
 
 
 @dataclass(frozen=True)
@@ -23,13 +23,19 @@ class FakeModel:
         del text
         return self.response
 
-    def stream(self, input: ModelInput) -> Iterable[ModelStreamItem]:
+    def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]:
         del input
         for chunk in self.chunks if self.chunks is not None else (self.response,):
-            if self.delay_seconds:
-                time.sleep(self.delay_seconds)
+            remaining = self.delay_seconds
+            while remaining > 0 and not cancellation.is_cancelled():
+                interval = min(remaining, 0.01)
+                time.sleep(interval)
+                remaining -= interval
+            if cancellation.is_cancelled():
+                return
             yield ModelChunk(chunk)
-        yield ModelOutcome(self.outcome)
+        if not cancellation.is_cancelled():
+            yield ModelOutcome(self.outcome)
 
 
 @dataclass
@@ -106,9 +112,9 @@ class RecordingModel(FakeModel):
 
     inputs: list[ModelInput] = field(default_factory=list)
 
-    def stream(self, input: ModelInput) -> Iterable[ModelStreamItem]:
+    def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]:
         self.inputs.append(input)
-        yield from super().stream(input)
+        yield from super().stream(input, cancellation)
 
 
 class CleanupTrigger:
