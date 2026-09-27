@@ -1,11 +1,12 @@
 """Application-owned text turns, volatile transcripts, and lifecycle fences."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Iterator, Mapping
 
-from .ports import CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
@@ -19,6 +20,8 @@ MAX_STREAM_CONTENT_BYTES = 64 * 1024
 MAX_STREAM_EVENT_CONTENT_BYTES = 7 * 1024
 MAX_OPEN_SESSIONS = 10
 MAX_ACTIVE_TURNS = 2
+MAX_QUEUED_TURNS = 8
+TURN_DEADLINE_SECONDS = 30.0
 IDLE_SESSION_SECONDS = 30 * 60
 MAX_SESSION_SECONDS = 24 * 60 * 60
 REQUEST_RETENTION_SECONDS = 24 * 60 * 60
@@ -88,12 +91,14 @@ class _Request:
     seq: int = 0
     terminal_emitted: bool = False
     cancellation: CancellationSignal = field(default_factory=CancellationSignal)
+    queued: bool = False
+    deadline_at: float = 0.0
 
 
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -104,6 +109,8 @@ class TextGateway:
         self._ledger = ledger
         self._sessions: dict[str, Session] = {}
         self._requests: dict[str, _Request] = {}
+        self._queued_request_ids: deque[str] = deque()
+        self._turn_deadline_seconds = turn_deadline_seconds
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
         if not startup.ready:
@@ -140,14 +147,19 @@ class TextGateway:
                 raise AdmissionError(409, "service_unready", "conflict_or_expired_reference", "Service is unavailable.", True)
             if any(request.session_id == session_id and request.context_generation == session.context_generation and request.outcome is None for request in self._requests.values()):
                 raise AdmissionError(409, "turn_conflict", "conflict_or_expired_reference", "A turn is already active for this session.", True)
-            if sum(request.outcome is None for request in self._requests.values()) >= MAX_ACTIVE_TURNS:
+            active = sum(request.outcome is None and not request.queued for request in self._requests.values())
+            if active >= MAX_ACTIVE_TURNS and len(self._queued_request_ids) >= MAX_QUEUED_TURNS:
                 raise AdmissionError(429, "turn_capacity", "overload", "Turn capacity is reached.", True)
             if supplied_context and session.transcript:
                 raise AdmissionError(409, "context_conflict", "conflict_or_expired_reference", "Session context is already established.")
             model_input = ModelInput((*(session.transcript or supplied_context), ModelMessage("user", text)))
             _validate_transcript_capacity(model_input.messages)
             session.last_active_at = self._monotonic()
-            request = _Request(self._identifiers.next_id("request"), session.session_id, self._identifiers.next_id("trace"), session.context_generation)
+            request = _Request(
+                self._identifiers.next_id("request"), session.session_id, self._identifiers.next_id("trace"), session.context_generation,
+                queued=active >= MAX_ACTIVE_TURNS,
+                deadline_at=self._monotonic() + self._turn_deadline_seconds,
+            )
             admitted_at = self._clock.now()
             try:
                 self._ledger.reserve(
@@ -165,6 +177,8 @@ class TextGateway:
             except RequestLedgerUnavailable:
                 raise AdmissionError(503, "request_ledger_unavailable", "dependency_unavailable", "Request status storage is unavailable.", True) from None
             self._requests[request.request_id] = request
+            if request.queued:
+                self._queued_request_ids.append(request.request_id)
         return self._stream(request, model_input, text, supplied_context)
 
     def reset_session(self, session_id: str) -> Session:
@@ -216,6 +230,9 @@ class TextGateway:
             request = self._requests.get(request_id)
             if request is not None and request.outcome is None:
                 request.cancellation.cancel()
+                if request.queued:
+                    self._remove_queued_locked(request.request_id)
+                self._synchronization.notify_all()
                 return {"request_id": request_id, "state": "cancellation_requested"}
             try:
                 record = self._ledger.lookup(request_id, self._clock.now())
@@ -241,8 +258,13 @@ class TextGateway:
 
     def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...]) -> Iterator[StreamEvent]:
         yield self._event(request, "accepted")
-        if self._is_fenced(request):
+        admission = self._await_start(request)
+        if admission == "cancelled":
             yield self._terminal(request, "cancelled")
+            return
+        if admission == "deadline":
+            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+            yield self._terminal(request, "failed")
             return
         try:
             model = self._model
@@ -260,15 +282,27 @@ class TextGateway:
                 if self._is_fenced(request):
                     yield self._terminal(request, "cancelled")
                     return
+                if self._deadline_expired(request):
+                    yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                    yield self._terminal(request, "failed")
+                    return
                 try:
                     item = next(provider_stream)
                 except StopIteration:
                     if self._is_fenced(request):
                         yield self._terminal(request, "cancelled")
                         return
+                    if self._deadline_expired(request):
+                        yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                        yield self._terminal(request, "failed")
+                        return
                     break
                 if self._is_fenced(request):
                     yield self._terminal(request, "cancelled")
+                    return
+                if self._deadline_expired(request):
+                    yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                    yield self._terminal(request, "failed")
                     return
                 if isinstance(item, ModelChunk):
                     if saw_proposal:
@@ -318,6 +352,10 @@ class TextGateway:
                     if record_result == "fenced":
                         yield self._terminal(request, "cancelled")
                         return
+                    if record_result == "deadline":
+                        yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                        yield self._terminal(request, "failed")
+                        return
                     if record_result == "limit":
                         yield self._error(request, "transcript_limit", "internal_failure", "Response exceeded a context limit.", False)
                         yield self._terminal(request, "failed")
@@ -333,9 +371,24 @@ class TextGateway:
             if not saw_outcome:
                 yield self._error(request, "missing_outcome", "uncertainty", "Model outcome is unavailable.", False)
                 yield self._terminal(request, "outcome_unknown")
+        except ModelOperationFailure as failure:
+            if self._is_fenced(request):
+                yield self._terminal(request, "cancelled")
+                return
+            if self._deadline_expired(request):
+                yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                yield self._terminal(request, "failed")
+                return
+            code, category, message, retryable = _safe_model_failure(failure)
+            yield self._error(request, code, category, message, retryable)
+            yield self._terminal(request, "failed")
         except Exception:
             if self._is_fenced(request):
                 yield self._terminal(request, "cancelled")
+                return
+            if self._deadline_expired(request):
+                yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                yield self._terminal(request, "failed")
                 return
             yield self._error(request, "model_failure", "internal_failure", "Model did not complete the turn.", True)
             yield self._terminal(request, "failed")
@@ -365,6 +418,8 @@ class TextGateway:
         request.outcome = outcome
         event = self._event(request, "terminal", outcome=outcome)
         self._requests.pop(request.request_id, None)
+        self._remove_queued_locked(request.request_id)
+        self._promote_queued_locked()
         return event
 
     def _content_delta(self, request: _Request, content: str) -> StreamEvent | None:
@@ -383,6 +438,8 @@ class TextGateway:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
                 return "fenced", None
+            if self._deadline_expired_locked(request):
+                return "deadline", None
             session = self._sessions[request.session_id]
             updated = (*(session.transcript or supplied_context), ModelMessage("user", text), ModelMessage("assistant", response))
             try:
@@ -401,6 +458,66 @@ class TextGateway:
         session = self._sessions.get(request.session_id)
         return request.cancellation.is_cancelled() or request.outcome == "cancelled" or session is None or session.context_generation != request.context_generation
 
+    def _await_start(self, request: _Request) -> str:
+        """Wait at the application boundary; queued work never reaches the model."""
+        with self._synchronization.locked():
+            while request.queued and not request.cancellation.is_cancelled():
+                remaining = request.deadline_at - self._monotonic()
+                if remaining <= 0:
+                    self._remove_queued_locked(request.request_id)
+                    return "deadline"
+                self._synchronization.wait(remaining)
+            if request.cancellation.is_cancelled() or self._is_fenced_locked(request):
+                return "cancelled"
+            if self._deadline_expired_locked(request):
+                return "deadline"
+            return "started"
+
+    def _deadline_expired(self, request: _Request) -> bool:
+        with self._synchronization.locked():
+            return self._deadline_expired_locked(request)
+
+    def _deadline_expired_locked(self, request: _Request) -> bool:
+        return self._monotonic() >= request.deadline_at
+
+    def _remove_queued_locked(self, request_id: str) -> None:
+        try:
+            self._queued_request_ids.remove(request_id)
+        except ValueError:
+            return
+
+    def _promote_queued_locked(self) -> None:
+        if self._active_turn_count_locked() >= MAX_ACTIVE_TURNS:
+            self._synchronization.notify_all()
+            return
+        while self._queued_request_ids:
+            request_id = self._queued_request_ids.popleft()
+            request = self._requests.get(request_id)
+            if request is None or request.outcome is not None or request.cancellation.is_cancelled():
+                continue
+            request.queued = False
+            self._synchronization.notify_all()
+            return
+        self._synchronization.notify_all()
+
+    def _prune_expired_queued_locked(self) -> None:
+        """Release expired queued admissions even when their stream is never resumed."""
+        for request_id in tuple(self._queued_request_ids):
+            request = self._requests.get(request_id)
+            if request is None or request.outcome is not None:
+                self._remove_queued_locked(request_id)
+                continue
+            if self._deadline_expired_locked(request):
+                self._remove_queued_locked(request_id)
+                request.outcome = "failed"
+                try:
+                    self._ledger.mark_terminal(request.request_id, "failed")
+                except RequestLedgerUnavailable:
+                    pass
+
+    def _active_turn_count_locked(self) -> int:
+        return sum(request.outcome is None and not request.queued for request in self._requests.values())
+
     def _expire_sessions_locked(self) -> None:
         now = self._monotonic()
         expired = [
@@ -412,6 +529,7 @@ class TextGateway:
         for session_id in expired:
             self._cancel_generation_locked(session_id, self._sessions[session_id].context_generation)
             del self._sessions[session_id]
+        self._prune_expired_queued_locked()
 
     def _generation_active_locked(self, session_id: str, generation: int) -> bool:
         return any(request.session_id == session_id and request.context_generation == generation and request.outcome is None for request in self._requests.values())
@@ -420,6 +538,9 @@ class TextGateway:
         for request in self._requests.values():
             if request.session_id == session_id and request.context_generation == generation and request.outcome is None:
                 request.cancellation.cancel()
+                if request.queued:
+                    self._remove_queued_locked(request.request_id)
+        self._synchronization.notify_all()
 
     def _monotonic(self) -> float:
         if not hasattr(self._clock, "monotonic"):
@@ -434,6 +555,13 @@ def _utf8_length(value: object) -> int | None:
         return len(value.encode("utf-8"))
     except UnicodeError:
         return None
+
+
+def _safe_model_failure(failure: ModelOperationFailure) -> tuple[str, str, str, bool]:
+    """Keep a port implementation from selecting arbitrary public error fields."""
+    if failure.category == "timeout":
+        return "model_operation_timeout", "timeout", "Model operation timed out.", True
+    return "model_unavailable", "dependency_unavailable", "Model streaming is unavailable.", True
 
 
 def _request_expiry(admitted_at: str) -> str:

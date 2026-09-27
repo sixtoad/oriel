@@ -8,7 +8,9 @@ import unittest
 
 from oriel.adapters.bootstrap import ThreadSafeSynchronization
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
-from oriel.adapters.http import HealthServer
+from oriel.adapters.http import HealthServer, ready_payload
+from oriel.application.startup import StartupState
+from oriel.domain.configuration import parse_core_config
 from oriel.application.configuration import ConfigurationService
 
 
@@ -51,7 +53,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(live_status, 200)
         self.assertEqual(json.loads(live_body), {"api_version": "1.0", "state": "live"})
         self.assertEqual(ready_status, 200)
-        self.assertEqual(json.loads(ready_body), {"api_version": "1.0", "state": "ready"})
+        self.assertEqual(json.loads(ready_body), {"api_version": "1.0", "state": "ready", "components": {"core": {"state": "ready"}, "model": {"state": "ready"}, "ha": {"state": "disabled"}}})
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
 
     def test_bad_config_leaves_live_up_and_ready_sanitized(self):
@@ -67,7 +69,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(live_status, 200)
         self.assertEqual(json.loads(live_body)["state"], "live")
         self.assertEqual(ready_status, 503)
-        self.assertEqual(json.loads(ready_body), {"api_version": "1.0", "state": "unready", "code": "config_unavailable"})
+        self.assertEqual(json.loads(ready_body), {"api_version": "1.0", "state": "unready", "code": "config_unavailable", "components": {"core": {"state": "unready", "code": "config_unavailable"}, "model": {"state": "unready", "code": "model_unavailable"}, "ha": {"state": "disabled"}}})
         for private_value in ("PRIVATE_PATH_MUST_NOT_LEAK", "PRIVATE_REFERENCE_MUST_NOT_LEAK", "PRIVATE_PAYLOAD_MUST_NOT_LEAK"):
             self.assertNotIn(private_value, ready_body.decode("utf-8"))
 
@@ -79,6 +81,22 @@ class HttpTests(unittest.TestCase):
         post_status, _headers, post_body = self.request(server, "/v1/sessions", "POST")
         self.assertEqual(post_status, 404)
         self.assertEqual(post_body, b"")
+
+    def test_ready_health_keeps_optional_ha_degradation_out_of_chat_readiness(self):
+        config = parse_core_config({"api_version": "1.0", "provider": {"connection_ref": "safe"}, "skills": {}})
+        ready = ready_payload(StartupState(config, None, optional_ha_state="degraded"))
+        model_unready = ready_payload(StartupState(config, "model_unavailable", model_ready=False, model_code="model_unavailable"))
+        self.assertEqual(ready, {"api_version": "1.0", "state": "ready", "components": {"core": {"state": "ready"}, "model": {"state": "ready"}, "ha": {"state": "degraded"}}})
+        self.assertEqual(model_unready["state"], "unready")
+        self.assertEqual(model_unready["code"], "model_unavailable")
+        self.assertEqual(model_unready["components"]["ha"], {"state": "disabled"})
+
+    def test_model_unready_health_is_a_sanitized_503(self):
+        config = parse_core_config({"api_version": "1.0", "provider": {"connection_ref": "safe"}, "skills": {}})
+        server = self.with_server(StartupState(config, "model_unavailable", model_ready=False, model_code="model_unavailable"))
+        status, _headers, body = self.request(server, "/ready")
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["components"]["model"], {"state": "unready", "code": "model_unavailable"})
 
 
 if __name__ == "__main__":

@@ -22,10 +22,15 @@ def live_payload() -> dict[str, str]:
     return {"api_version": API_VERSION, "state": "live"}
 
 
-def ready_payload(startup: StartupState) -> dict[str, str]:
+def ready_payload(startup: StartupState) -> dict[str, object]:
     if startup.ready:
-        return {"api_version": API_VERSION, "state": "ready"}
-    return {"api_version": API_VERSION, "state": "unready", "code": startup.code or "config_unavailable"}
+        return {"api_version": API_VERSION, "state": "ready", "components": startup.components}
+    return {
+        "api_version": API_VERSION,
+        "state": "unready",
+        "code": startup.code or startup.model_code or "config_unavailable",
+        "components": startup.components,
+    }
 
 
 def _canonical_json(payload: object) -> bytes:

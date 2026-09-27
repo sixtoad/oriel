@@ -8,12 +8,12 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelProposal, ModelStreamItem
+from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, ModelStreamItem
 from ..domain.proposals import validate_proposal
 from .configuration import OpenAICompatibleProfile
 
 
-MODEL_DEADLINE_SECONDS = 30
+PROVIDER_OPERATION_TIMEOUT_SECONDS = 5
 MAX_PROVIDER_RECORD_BYTES = 8 * 1024
 MAX_TOOL_ARGUMENT_BYTES = 8 * 1024
 PROPOSAL_DIALECT = "oriel-proposal-v1"
@@ -64,17 +64,23 @@ class OpenAICompatibleStreamingModel:
     def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]:
         if cancellation.is_cancelled():
             return
-        request = self._request(input)
         try:
-            response = self.opener(request, timeout=MODEL_DEADLINE_SECONDS)
+            request = self._request(input)
+            response = self.opener(request, timeout=PROVIDER_OPERATION_TIMEOUT_SECONDS)
             with response:
                 status = response.status if hasattr(response, "status") else response.getcode()
                 content_type = response.headers.get_content_type() if hasattr(response.headers, "get_content_type") else response.headers.get("Content-Type", "").split(";", 1)[0]
                 if type(status) is not int or not isinstance(content_type, str) or status < 200 or status >= 300 or content_type.lower() != "text/event-stream":
                     raise ProviderStreamFailure("worker response unavailable")
                 yield from _decode_openai_sse(_iter_sse_records(response, cancellation), cancellation)
-        except (HTTPError, URLError, OSError, UnicodeError, ValueError, ProviderStreamFailure):
-            raise ProviderStreamFailure("worker stream unavailable") from None
+        except TimeoutError:
+            raise ModelOperationFailure("model_operation_timeout", "timeout", "Model operation timed out.") from None
+        except URLError as failure:
+            if isinstance(failure.reason, TimeoutError):
+                raise ModelOperationFailure("model_operation_timeout", "timeout", "Model operation timed out.") from None
+            raise ModelOperationFailure("model_unavailable", "dependency_unavailable", "Model streaming is unavailable.") from None
+        except (HTTPError, OSError, UnicodeError, ValueError, ProviderStreamFailure):
+            raise ModelOperationFailure("model_unavailable", "dependency_unavailable", "Model streaming is unavailable.") from None
 
     def _request(self, input: ModelInput) -> Request:
         body = {

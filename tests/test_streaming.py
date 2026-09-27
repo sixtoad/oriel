@@ -11,12 +11,12 @@ import time
 from threading import Event, Thread
 import unittest
 
-from oriel.adapters.bootstrap import DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import AdvanceableClock, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
-from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, RequestLedgerUnavailable
+from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, RequestLedgerUnavailable
 from oriel.application.text_gateway import AdmissionError, TextGateway
 
 
@@ -176,9 +176,178 @@ class StreamingHttpTests(unittest.TestCase):
         gateway.reset_session(first.session_id)
         replacement = iter(gateway.begin_turn(first.session_id, {"input": "replacement"}, self.startup))
         self.assertEqual(next(replacement).context_generation, 1)
+        queued_sessions = [gateway.create_session() for _ in range(8)]
+        for queued_session in queued_sessions:
+            next(iter(gateway.begin_turn(queued_session.session_id, {"input": "queued"}, self.startup)))
         with self.assertRaises(AdmissionError) as capacity:
             gateway.begin_turn(second.session_id, {"input": "blocked"}, self.startup)
         self.assertEqual(capacity.exception.status, 429)
+
+    def test_queued_turn_is_accepted_cancelled_without_model_work_and_releases_fifo_capacity(self):
+        class BlockingModel(FakeModel):
+            calls = 0
+
+            def __init__(self):
+                super().__init__()
+                self.started = Event()
+                self.release = Event()
+                self.inputs: list[str] = []
+
+            def stream(self, input, cancellation):
+                self.inputs.append(input.messages[-1].content)
+                self.calls += 1
+                self.started.set()
+                self.release.wait(1)
+                if not cancellation.is_cancelled():
+                    yield ModelChunk("reply")
+                    yield ModelOutcome("completed")
+
+        model = BlockingModel()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        sessions = [gateway.create_session() for _ in range(5)]
+        streams = [iter(gateway.begin_turn(session.session_id, {"input": text}, self.startup)) for session, text in zip(sessions, ("one", "two", "three", "four", "five"), strict=True)]
+        accepted = [next(stream) for stream in streams]
+        active = [Thread(target=lambda stream=stream: list(stream), daemon=True) for stream in streams[:2]]
+        for thread in active:
+            thread.start()
+        self.assertTrue(model.started.wait(0.25))
+        self.assertEqual(model.calls, 2)
+        queued_events: list[object] = []
+        queued_thread = Thread(target=lambda: queued_events.extend(streams[2]), daemon=True)
+        queued_thread.start()
+        started = time.monotonic()
+        self.assertEqual(gateway.cancel_request(accepted[2].request_id)["state"], "cancellation_requested")
+        queued_thread.join(0.25)
+        self.assertFalse(queued_thread.is_alive())
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertEqual(model.calls, 2)
+        self.assertEqual([(event.type, event.outcome) for event in queued_events], [("terminal", "cancelled")])
+        fourth_events: list[object] = []
+        fourth_thread = Thread(target=lambda: fourth_events.extend(streams[3]), daemon=True)
+        fifth_events: list[object] = []
+        fifth_thread = Thread(target=lambda: fifth_events.extend(streams[4]), daemon=True)
+        fourth_thread.start()
+        fifth_thread.start()
+        model.release.set()
+        for thread in active:
+            thread.join(1)
+        deadline = time.monotonic() + 0.25
+        while model.calls < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(model.calls, 4)
+        fourth_thread.join(1)
+        fifth_thread.join(1)
+        self.assertEqual(fourth_events[-1].outcome, "completed")
+        self.assertEqual(fifth_events[-1].outcome, "completed")
+        self.assertEqual(model.inputs[2:], ["four", "five"])
+
+    def test_expired_queued_turn_fails_without_opening_a_third_model_stream(self):
+        class BlockingModel(FakeModel):
+            calls = 0
+
+            def __init__(self):
+                super().__init__()
+                self.started = Event()
+                self.release = Event()
+
+            def stream(self, input, cancellation):
+                del input
+                self.calls += 1
+                self.started.set()
+                self.release.wait(1)
+                if not cancellation.is_cancelled():
+                    yield ModelOutcome("completed")
+
+        clock = AdvanceableClock()
+        model = BlockingModel()
+        gateway = TextGateway(model, clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=30)
+        sessions = [gateway.create_session() for _ in range(3)]
+        streams = [iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup)) for session in sessions]
+        for stream in streams:
+            self.assertEqual(next(stream).type, "accepted")
+        active = [Thread(target=lambda stream=stream: list(stream), daemon=True) for stream in streams[:2]]
+        for thread in active:
+            thread.start()
+        self.assertTrue(model.started.wait(0.25))
+        self.assertEqual(model.calls, 2)
+        clock.advance(30)
+        expired = list(streams[2])
+        self.assertEqual([(event.type, event.error and event.error["code"], event.outcome) for event in expired], [("error", "model_deadline", None), ("terminal", None, "failed")])
+        self.assertEqual(model.calls, 2)
+        model.release.set()
+        for thread in active:
+            thread.join(1)
+
+    def test_expired_unconsumed_queue_entries_release_admission_capacity(self):
+        clock = AdvanceableClock()
+        gateway = TextGateway(FakeModel(), clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=30)
+        active_sessions = [gateway.create_session() for _ in range(2)]
+        for session in active_sessions:
+            self.assertEqual(next(iter(gateway.begin_turn(session.session_id, {"input": "active"}, self.startup))).type, "accepted")
+        queued_sessions = [gateway.create_session() for _ in range(8)]
+        queued = [iter(gateway.begin_turn(session.session_id, {"input": "queued"}, self.startup)) for session in queued_sessions]
+        accepted = [next(stream) for stream in queued]
+        clock.advance(30)
+        gateway.expire_sessions()
+        for event in accepted:
+            self.assertEqual(gateway.request_status(event.request_id)["outcome"], "failed")
+        replacement = iter(gateway.begin_turn(queued_sessions[0].session_id, {"input": "replacement"}, self.startup))
+        self.assertEqual(next(replacement).type, "accepted")
+
+    def test_total_deadline_fails_once_and_fences_transcript_before_model_work(self):
+        clock = AdvanceableClock()
+
+        class LateModel(CountingModel):
+            def stream(self, input, cancellation):
+                self.calls += 1
+                del input, cancellation
+                yield ModelChunk("early")
+                clock.advance(30)
+                yield ModelChunk("late")
+                yield ModelOutcome("completed")
+
+        model = LateModel()
+        gateway = TextGateway(model, clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=30)
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        self.assertEqual(next(events).type, "accepted")
+        terminal_events = list(events)
+        self.assertEqual([(event.type, event.content, event.error and event.error["code"], event.outcome) for event in terminal_events], [("content_delta", "early", None, None), ("error", None, "model_deadline", None), ("terminal", None, None, "failed")])
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(gateway._sessions[session.session_id].transcript, ())
+
+    def test_deadline_wins_over_late_provider_failure_without_disclosing_port_fields(self):
+        clock = AdvanceableClock()
+
+        class LateFailureModel(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                clock.advance(30)
+                raise ModelOperationFailure("PRIVATE_CODE", "PRIVATE_CATEGORY", "PRIVATE_MESSAGE", False)
+                yield ModelOutcome("failed")
+
+        gateway = TextGateway(LateFailureModel(), clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=30)
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        self.assertEqual(next(events).type, "accepted")
+        terminal_events = list(events)
+        self.assertEqual([(event.type, event.error and event.error["code"], event.outcome) for event in terminal_events], [("error", "model_deadline", None), ("terminal", None, "failed")])
+        self.assertNotIn("PRIVATE", str(terminal_events))
+
+    def test_model_operation_failure_uses_the_bounded_public_dependency_envelope(self):
+        class PrivateFailureModel(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                raise ModelOperationFailure("PRIVATE_CODE", "PRIVATE_CATEGORY", "PRIVATE_MESSAGE", False)
+                yield ModelOutcome("failed")
+
+        gateway = TextGateway(PrivateFailureModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        session = gateway.create_session()
+        events = iter(gateway.begin_turn(session.session_id, {"input": "hello"}, self.startup))
+        self.assertEqual(next(events).type, "accepted")
+        terminal_events = list(events)
+        self.assertEqual([(event.type, event.error and event.error["code"], event.error and event.error["category"], event.outcome) for event in terminal_events], [("error", "model_unavailable", "dependency_unavailable", None), ("terminal", None, None, "failed")])
+        self.assertNotIn("PRIVATE", str(terminal_events))
 
     def test_completion_wins_before_cancellation_without_leaving_cancelled_context(self):
         class BlockingTerminalLedger(InMemoryRequestLedger):
@@ -447,8 +616,10 @@ class StreamingHttpTests(unittest.TestCase):
             self.assertEqual(self.read_frame(third_response)[0], "accepted")
             capacity_connection, capacity_response = self.turn_response(server, str(sessions[2]["session_id"]), b'{"input":"third"}')
             try:
-                self.assertEqual(capacity_response.status, 429)
-                self.assertEqual(json.loads(capacity_response.read())["error"]["category"], "overload")
+                self.assertEqual(capacity_response.status, 200)
+                queued_kind, queued = self.read_frame(capacity_response)
+                self.assertEqual(queued_kind, "accepted")
+                self.assertEqual(self.status(server, str(queued["request_id"]))["state"], "in_progress")
             finally:
                 capacity_connection.close()
             self.assertEqual(self.status(server, "unknown-request"), {"request_id": "unknown-request", "state": "unavailable"})
@@ -481,7 +652,7 @@ class StreamingHttpTests(unittest.TestCase):
         terminal = self.status(server, str(accepted["request_id"]))
         self.assertEqual(terminal["state"], "terminal")
         self.assertEqual(terminal["outcome"], "cancelled")
-        self.assertEqual(model.calls, 1)
+        self.assertLessEqual(model.calls, 1)
 
     def test_disconnect_during_silent_provider_work_cancels_before_completed_outcome(self):
         class SilentOutcomeModel(FakeModel):

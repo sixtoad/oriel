@@ -8,12 +8,13 @@ import tempfile
 import time
 from threading import Thread
 import unittest
+from urllib.error import URLError
 
 from oriel.adapters.bootstrap import FixedClock, InMemoryRequestLedger, NoopTelemetry, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, provider_profile_resolver
 from oriel.adapters.http import HealthServer
 from oriel.adapters.qwen import OpenAICompatibleStreamingModel, _decode_openai_sse
-from oriel.application.ports import CancellationSignal
+from oriel.application.ports import CancellationSignal, ModelInput, ModelMessage, ModelOperationFailure
 from oriel.application.startup import StartupState
 from oriel.application.text_gateway import TextGateway
 from oriel.domain.configuration import parse_core_config
@@ -193,7 +194,7 @@ class QwenAdapterTests(unittest.TestCase):
         frames = self.stream_turn(server, self.session_id(server), "hello")
 
         self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
-        self.assertEqual(frames[-2][1]["error"]["code"], "model_failure")
+        self.assertEqual(frames[-2][1]["error"]["code"], "model_unavailable")
         self.assertEqual(frames[-1][1]["outcome"], "failed")
         self.assertNotIn(worker.request_url, json.dumps(frames))
 
@@ -270,6 +271,62 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertEqual(next(decoded).content, "early")
         cancellation.cancel()
         self.assertEqual(list(decoded), [])
+
+    def test_provider_connect_timeout_is_bounded_and_sanitized(self) -> None:
+        received: list[float] = []
+
+        def timed_out(_request, timeout):
+            received.append(timeout)
+            raise TimeoutError("private worker address")
+
+        model = OpenAICompatibleStreamingModel(OpenAICompatibleProfile("http://private.invalid/stream", "revision", 1), opener=timed_out)
+        with self.assertRaises(ModelOperationFailure) as failure:
+            list(model.stream(ModelInput((ModelMessage("user", "hello"),)), CancellationSignal()))
+        self.assertEqual(received, [5])
+        self.assertEqual((failure.exception.code, failure.exception.category, failure.exception.message), ("model_operation_timeout", "timeout", "Model operation timed out."))
+        self.assertNotIn("private", str(failure.exception))
+
+    def test_provider_read_timeout_becomes_a_sanitized_accepted_stream_failure(self) -> None:
+        class Headers:
+            def get_content_type(self):
+                return "text/event-stream"
+
+        class ReadTimeoutResponse:
+            status = 200
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                del exc_type, exc, traceback
+                return False
+
+            def readline(self, limit):
+                del limit
+                raise URLError(TimeoutError("private provider read"))
+
+        model = OpenAICompatibleStreamingModel(
+            OpenAICompatibleProfile("http://private.invalid/stream", "revision", 1),
+            opener=lambda _request, timeout: ReadTimeoutResponse(),
+        )
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), RecordingTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        server = HealthServer(READY, gateway)
+        server.start()
+        self.addCleanup(server.close)
+        frames = self.stream_turn(server, self.session_id(server), "hello")
+        self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
+        self.assertEqual(frames[1][1]["error"], {
+            "code": "model_operation_timeout",
+            "category": "timeout",
+            "message": "Model operation timed out.",
+            "retryable": True,
+            "request_id": frames[0][1]["request_id"],
+            "session_id": frames[0][1]["session_id"],
+            "trace_id": frames[0][1]["trace_id"],
+        })
+        self.assertEqual(frames[2][1]["outcome"], "failed")
+        self.assertNotIn("private", json.dumps(frames))
 
 
 if __name__ == "__main__":

@@ -138,6 +138,17 @@ class ApiContractTests(unittest.TestCase):
         config = load_json(API / "schemas" / "config.json")
         self.assertEqual(set(config["properties"]["provider"]["properties"]), {"connection_ref"})
 
+    def test_health_schema_requires_components_for_readiness_and_codes_for_unready_components(self):
+        health = load_json(API / "schemas" / "health.json")
+        self.assertEqual(health["allOf"][0]["then"]["required"], ["components"])
+        self.assertEqual(health["allOf"][1]["then"]["required"], ["code", "components"])
+        self.assertEqual(health["allOf"][2]["then"]["not"]["anyOf"], [{"required": ["code"]}, {"required": ["components"]}])
+        ready_components = health["allOf"][0]["then"]["properties"]["components"]["properties"]
+        self.assertEqual(ready_components["core"]["properties"]["state"], {"const": "ready"})
+        self.assertEqual(ready_components["model"]["properties"]["state"], {"const": "ready"})
+        required_component = health["$defs"]["required_component"]
+        self.assertEqual(required_component["allOf"][0]["then"]["required"], ["code"])
+
     def test_loader_never_echoes_malformed_or_private_input(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "PRIVATE_PAYLOAD_MUST_NOT_APPEAR.json"

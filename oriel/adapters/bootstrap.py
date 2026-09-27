@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import secrets
-from threading import Event, RLock, Thread
+from threading import Condition, Event, RLock, Thread
 import time
 from typing import Callable, Iterable, Mapping
 
@@ -60,10 +60,16 @@ class ThreadSafeSynchronization:
     """Serializes access to one gateway's volatile application records."""
 
     def __init__(self) -> None:
-        self._lock = RLock()
+        self._lock = Condition(RLock())
 
-    def locked(self) -> RLock:
+    def locked(self) -> Condition:
         return self._lock
+
+    def wait(self, timeout: float | None = None) -> None:
+        self._lock.wait(timeout)
+
+    def notify_all(self) -> None:
+        self._lock.notify_all()
 
 
 @dataclass(frozen=True)

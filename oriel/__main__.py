@@ -5,15 +5,15 @@ import argparse
 import json
 from pathlib import Path
 from http.client import HTTPConnection
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
-from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, activate_startup, provider_profile_resolver
+from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver
 from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
 from .adapters.request_ledger import SQLiteRequestLedger
 from .application.configuration import ConfigurationService
-from .application.ports import RequestLedgerUnavailable
+from .application.ports import CancellationSignal, ModelInput, ModelMessage, RequestLedgerUnavailable
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION
 
@@ -29,7 +29,12 @@ def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
         connection.close()
 
 
-def _compose_startup(config_path: str | None = None, environ: Mapping[str, str] | None = None):
+def _compose_startup(
+    config_path: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    model_probe: Callable[[object], bool] | None = None,
+    optional_ha_probe: Callable[[], bool] | None = None,
+):
     """Select the one local profile resolver and activate configuration once."""
     configuration = ConfigurationService(ThreadSafeSynchronization())
     try:
@@ -37,7 +42,14 @@ def _compose_startup(config_path: str | None = None, environ: Mapping[str, str] 
     except ProfileUnavailable:
         # Preserve the config adapter's sanitized unavailable-profile outcome.
         resolver = _UnavailableProfileResolver()
-    return activate_startup(configuration, resolver, explicit_path=config_path, environ=environ)
+    return activate_startup(
+        configuration,
+        resolver,
+        explicit_path=config_path,
+        environ=environ,
+        model_probe=model_probe or (lambda profile: _model_ready(profile, environ)),
+        optional_ha_probe=optional_ha_probe,
+    )
 
 
 class _UnavailableProfileResolver:
@@ -50,6 +62,20 @@ def _model_for_profile(profile: object, environ: Mapping[str, str] | None = None
     if isinstance(profile, OpenAICompatibleProfile):
         return OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
     return FakeModel()
+
+
+def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> bool:
+    """Probe the selected local model through its adapter without publishing provider details."""
+    if isinstance(profile, ResolvedProviderProfile):
+        return True
+    if not isinstance(profile, OpenAICompatibleProfile):
+        return False
+    try:
+        model = OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
+        next(iter(model.stream(ModelInput((ModelMessage("user", "health"),)), CancellationSignal())))
+        return True
+    except Exception:
+        return False
 
 
 def run_self_test(config_path: str | None = None) -> dict[str, object]:

@@ -8,6 +8,66 @@
   "properties": {
     "api_version": {"const": "1.0"},
     "state": {"enum": ["live", "ready", "unready"]},
-    "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+    "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["core", "model", "ha"],
+      "properties": {
+        "core": {"$ref": "#/$defs/required_component"},
+        "model": {"$ref": "#/$defs/required_component"},
+        "ha": {"$ref": "#/$defs/optional_component"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"state": {"const": "ready"}}, "required": ["state"]},
+      "then": {
+        "required": ["components"],
+        "properties": {
+          "components": {
+            "properties": {
+              "core": {"properties": {"state": {"const": "ready"}}, "required": ["state"]},
+              "model": {"properties": {"state": {"const": "ready"}}, "required": ["state"]}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"state": {"const": "unready"}}, "required": ["state"]},
+      "then": {"required": ["code", "components"]}
+    },
+    {
+      "if": {"properties": {"state": {"const": "live"}}, "required": ["state"]},
+      "then": {"not": {"anyOf": [{"required": ["code"]}, {"required": ["components"]}]}}
+    }
+  ],
+  "$defs": {
+    "required_component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["ready", "unready"]},
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "unready"}}, "required": ["state"]},
+          "then": {"required": ["code"]}
+        }
+      ]
+    },
+    "optional_component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["disabled", "degraded", "ready"]},
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+      }
+    }
   }
 }

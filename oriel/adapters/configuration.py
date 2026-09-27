@@ -6,15 +6,17 @@ import math
 import os
 from pathlib import Path
 from dataclasses import dataclass
+from threading import Event, Thread
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import urlparse
 
 from ..application.configuration import ActivationResult, ActivationSucceeded, ConfigurationService
-from ..application.startup import StartupState, UNREADY_CODE
+from ..application.startup import MODEL_UNREADY_CODE, StartupState, UNREADY_CODE
 from ..domain.configuration import ConfigError, parse_core_config
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("fake-model.json")
+PROBE_TIMEOUT_SECONDS = 5.0
 
 
 class ProfileUnavailable(ValueError):
@@ -202,6 +204,9 @@ def activate_startup(
     explicit_path: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
     default_path: Path = DEFAULT_CONFIG_PATH,
+    model_probe: Callable[[ProviderProfile], bool] | None = None,
+    optional_ha_probe: Callable[[], bool] | None = None,
+    probe_timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
 ) -> tuple[StartupState, ProviderProfile | None]:
     """Select, validate, resolve, and atomically activate one startup document.
 
@@ -221,11 +226,39 @@ def activate_startup(
     except ProfileUnavailable:
         return _startup_from_result(service.reject()), None
     result = service.activate_config(candidate, expected_revision, profile.label)
-    return _startup_from_result(result), profile if isinstance(result, ActivationSucceeded) else None
+    active_profile = profile if isinstance(result, ActivationSucceeded) else None
+    model_ready = active_profile is not None
+    if model_ready and model_probe is not None:
+        model_ready = _bounded_probe(model_probe, active_profile, probe_timeout_seconds)
+    optional_ha_state = "disabled"
+    if optional_ha_probe is not None:
+        optional_ha_state = "ready" if _bounded_probe(optional_ha_probe, None, probe_timeout_seconds) else "degraded"
+    return _startup_from_result(result, model_ready, optional_ha_state), active_profile
 
 
-def _startup_from_result(result: ActivationResult) -> StartupState:
+def _startup_from_result(result: ActivationResult, model_ready: bool | None = None, optional_ha_state: str = "disabled") -> StartupState:
     active = result.active
     if active is None:
-        return StartupState(None, UNREADY_CODE, activation_result=result)
-    return StartupState(active.config, None, active.revision, active.effective, result)
+        return StartupState(None, UNREADY_CODE, activation_result=result, model_ready=False, optional_ha_state=optional_ha_state)
+    is_model_ready = True if model_ready is None else model_ready
+    return StartupState(active.config, None if is_model_ready else MODEL_UNREADY_CODE, active.revision, active.effective, result, is_model_ready, None if is_model_ready else MODEL_UNREADY_CODE, optional_ha_state)
+
+
+def _bounded_probe(probe: Callable[..., bool], profile: ProviderProfile | None, timeout_seconds: float) -> bool:
+    """Treat a blocked or failing probe as unavailable without delaying liveness."""
+    completed = Event()
+    result: list[bool] = []
+
+    def run() -> None:
+        try:
+            result.append(bool(probe() if profile is None else probe(profile)))
+        except Exception:
+            result.append(False)
+        finally:
+            completed.set()
+
+    try:
+        Thread(target=run, daemon=True).start()
+    except RuntimeError:
+        return False
+    return completed.wait(max(0.0, timeout_seconds)) and result == [True]

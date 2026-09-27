@@ -69,6 +69,16 @@ class StreamingModelPort(Protocol):
     def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]: ...
 
 
+@dataclass(frozen=True)
+class ModelOperationFailure(RuntimeError):
+    """A sanitized, provider-neutral failure from one bounded model operation."""
+
+    code: str
+    category: str
+    message: str
+    retryable: bool = True
+
+
 class IdentifierPort(Protocol):
     """Mints opaque correlation handles for application-owned records."""
 
@@ -79,6 +89,10 @@ class SynchronizationPort(Protocol):
     """Provides a narrow critical section for volatile application records."""
 
     def locked(self) -> ContextManager[None]: ...
+
+    def wait(self, timeout: float | None = None) -> None: ...
+
+    def notify_all(self) -> None: ...
 
 
 class Clock(Protocol):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import time
 from threading import Barrier, Thread
 import unittest
 from unittest.mock import patch
@@ -51,7 +52,8 @@ class StartupTests(unittest.TestCase):
             instances: list[object] = []
 
             def __init__(self, startup, gateway, host, port):
-                del startup, host, port
+                del host, port
+                self.startup = startup
                 self.gateway = gateway
                 self.instances.append(self)
 
@@ -66,7 +68,7 @@ class StartupTests(unittest.TestCase):
             config = self.write(root, "config.json", VALID_CONFIG)
             ledger_path = root / "ledger.sqlite3"
             ledger = SQLiteRequestLedger(ledger_path)
-            ledger.reserve(RequestStatusRecord("request-1", "session-1", "trace-1", 0, "in_progress", None, "2026-09-26T10:00:00Z", "2026-09-27T10:00:00Z"))
+            ledger.reserve(RequestStatusRecord("request-1", "session-1", "trace-1", 0, "in_progress", None, "2099-09-26T10:00:00Z", "2099-09-27T10:00:00Z"))
             ledger.close()
 
             self.assertEqual(main(["--config", str(config), "--ledger", str(ledger_path)]), 0)
@@ -77,6 +79,11 @@ class StartupTests(unittest.TestCase):
             with self.assertRaises(AdmissionError) as unavailable:
                 CapturingServer.instances[-1].gateway.request_status("request-1")
             self.assertEqual(unavailable.exception.status, 503)
+
+            with patch("oriel.__main__._model_ready", return_value=False):
+                self.assertEqual(main(["--config", str(config), "--ledger", str(ledger_path)]), 0)
+            self.assertFalse(CapturingServer.instances[-1].startup.ready)
+            self.assertEqual(CapturingServer.instances[-1].startup.code, "model_unavailable")
 
     def test_explicit_path_wins_over_environment_then_packaged_default(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -280,6 +287,29 @@ class StartupTests(unittest.TestCase):
         self.assertFalse(unavailable.ready)
         self.assertEqual(unavailable.code, UNREADY_CODE)
         self.assertIsNone(unavailable_profile)
+
+    def test_composition_uses_sanitized_model_and_optional_dependency_probe_states(self):
+        model_down, _profile = _compose_startup(model_probe=lambda _profile: False, optional_ha_probe=lambda: False)
+        model_up, _profile = _compose_startup(model_probe=lambda _profile: True, optional_ha_probe=lambda: True)
+        self.assertFalse(model_down.ready)
+        self.assertEqual(model_down.code, "model_unavailable")
+        self.assertEqual(model_down.components, {"core": {"state": "ready"}, "model": {"state": "unready", "code": "model_unavailable"}, "ha": {"state": "degraded"}})
+        self.assertTrue(model_up.ready)
+        self.assertEqual(model_up.components["ha"], {"state": "ready"})
+
+    def test_blocked_probe_makes_startup_unready_without_delaying_liveness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.write(Path(directory), "config.json", VALID_CONFIG)
+            started = time.monotonic()
+            state, _profile = activate_startup(
+                ConfigurationService(ThreadSafeSynchronization()),
+                StaticProfileResolver({"fake": ResolvedProviderProfile("test")}),
+                explicit_path=config,
+                model_probe=lambda _profile: time.sleep(1) or True,
+                probe_timeout_seconds=0.01,
+            )
+        self.assertLess(time.monotonic() - started, 0.25)
+        self.assertFalse(state.ready)
 
     def test_profile_resolution_is_selected_at_restart_not_live_rewired(self):
         with tempfile.TemporaryDirectory() as directory:
