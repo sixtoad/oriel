@@ -3,11 +3,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import secrets
-from threading import Condition, Event, Lock, RLock, Thread
+from threading import Condition, Event, Lock, RLock, Thread, Timer as ThreadingTimer
 import time
 from typing import Callable, Iterable, Mapping
 
 from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
+
+
+class ThreadingScheduler:
+    """Production scheduler for application-owned lifecycle callbacks."""
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> ThreadingTimer:
+        timer = ThreadingTimer(max(0.0, delay_seconds), callback)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+
+class ThreadingTasks:
+    """Production task runner for a blocking provider stream."""
+
+    def start(self, callback: Callable[[], None]) -> None:
+        Thread(target=callback, daemon=True).start()
+
+
+class DeterministicScheduler:
+    """Manually advanced scheduler used with deterministic clocks in focused tests."""
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+        self._calls: list[tuple[float, Callable[[], None], _DeterministicCall]] = []
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> "_DeterministicCall":
+        call = _DeterministicCall()
+        self._calls.append((self.seconds + max(0.0, delay_seconds), callback, call))
+        return call
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+        due = [entry for entry in self._calls if entry[0] <= self.seconds]
+        self._calls = [entry for entry in self._calls if entry[0] > self.seconds]
+        for _deadline, callback, call in due:
+            if not call.cancelled:
+                callback()
+
+
+@dataclass
+class _DeterministicCall:
+    cancelled: bool = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
 
 @dataclass(frozen=True)

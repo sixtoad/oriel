@@ -7,7 +7,7 @@ from pathlib import Path
 from http.client import HTTPConnection
 from typing import Callable, Mapping
 
-from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
+from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
 from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver
 from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
@@ -109,11 +109,11 @@ def main(argv: list[str] | None = None) -> int:
     startup, _profile = _compose_startup(args.config)
     try:
         ledger = SQLiteRequestLedger(args.ledger)
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks())
         gateway.recover_interrupted_requests()
     except RequestLedgerUnavailable:
         ledger = UnavailableRequestLedger()
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks())
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()

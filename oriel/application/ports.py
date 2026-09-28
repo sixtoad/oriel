@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ContextManager, Iterable, Mapping, Protocol
+from typing import Callable, ContextManager, Iterable, Mapping, Protocol
 
 
 class ModelPort(Protocol):
@@ -107,6 +107,24 @@ class MonotonicClock(Protocol):
     """Supplies monotonic seconds for volatile lifecycle decisions."""
 
     def monotonic(self) -> float: ...
+
+
+class ScheduledCall(Protocol):
+    """Allows application lifecycle code to retract a scheduled callback."""
+
+    def cancel(self) -> None: ...
+
+
+class SchedulerPort(Protocol):
+    """Schedules application-owned callbacks without choosing timer infrastructure."""
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> ScheduledCall: ...
+
+
+class BackgroundTaskPort(Protocol):
+    """Runs provider work outside the stream-event serialization loop."""
+
+    def start(self, callback: Callable[[], None]) -> None: ...
 
 
 class StatePort(Protocol):

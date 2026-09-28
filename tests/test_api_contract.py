@@ -61,6 +61,16 @@ class ApiContractTests(unittest.TestCase):
                 mutate(events)
                 self.assertIn(expected, "\n".join(validate_stream(events)))
 
+        for field, value in (
+            ("content", "not an answer"),
+            ("proposal", load_json(EXAMPLES / "valid" / "generic-action.json")["proposal"]),
+            ("error", {"code": "model_failure", "category": "internal_failure", "message": "Model did not complete the turn.", "retryable": True}),
+        ):
+            with self.subTest(field=field):
+                events = copy.deepcopy(valid)
+                events[1][field] = value
+                self.assertIn("ack may only carry", "\n".join(validate_stream(events)))
+
         missing_content = copy.deepcopy(valid)
         missing_content[2].pop("content")
         self.assertIn("requires content", "\n".join(validate_stream(missing_content)))

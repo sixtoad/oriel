@@ -12,12 +12,12 @@ from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
-from oriel.adapters.bootstrap import AdvanceableClock, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RecordingTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import AdvanceableClock, DeterministicScheduler, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RecordingTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
-from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, RequestLedgerUnavailable
+from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, RequestLedgerUnavailable
 from oriel.application.fast_router import FastRoute
 from oriel.application.text_gateway import AdmissionError, TextGateway
 
@@ -74,8 +74,8 @@ class StreamingHttpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._directory.cleanup()
 
-    def with_server(self, model: FakeModel, ledger: object | None = None) -> HealthServer:
-        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger())
+    def with_server(self, model: FakeModel, ledger: object | None = None, scheduler=None, tasks=None) -> HealthServer:
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks)
         server = HealthServer(self.startup, gateway)
         server.start()
         self.addCleanup(server.close)
@@ -194,14 +194,16 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(model.calls, 0)
         self.assertEqual([(message.role, message.content) for message in gateway._sessions[session.session_id].transcript], [("user", "  ORIEL\tHELP! "), ("assistant", "Oriel can provide limited deterministic responses.")])
 
-        self.assertEqual(telemetry.records, [("route_selected", {
+        self.assertEqual(telemetry.records[0], ("route_selected", {
             "request_id": safe[0].request_id,
             "session_id": session.session_id,
             "trace_id": safe[0].trace_id,
             "route": "content",
             "rule_revision": "1",
             "duration_ms": "0",
-        })])
+        }))
+        self.assertEqual([event for event, _fields in telemetry.records[1:]], ["first_useful_content", "terminal"])
+        self.assertTrue(all("content" not in fields for _event, fields in telemetry.records))
         self.assertNotIn("ORIEL", str(telemetry.records))
         self.assertEqual(tools.calls, [])
 
@@ -265,7 +267,7 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(model.calls, 0)
         self.assertEqual(tools.calls, [])
         self.assertEqual(
-            telemetry.records,
+            [record for record in telemetry.records if record[0] == "route_selected"],
             [
                 (
                     "route_selected",
@@ -287,6 +289,9 @@ class StreamingHttpTests(unittest.TestCase):
                 )
             ],
         )
+        self.assertEqual([event for event, _fields in telemetry.records].count("first_useful_content"), 4)
+        self.assertEqual([event for event, _fields in telemetry.records].count("terminal"), 5)
+        self.assertTrue(all("content" not in fields for _event, fields in telemetry.records))
 
     def test_route_telemetry_failure_does_not_strand_an_accepted_turn(self):
         gateway = TextGateway(CountingModel(), FixedClock(), VolatileState(), FailingTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
@@ -316,6 +321,210 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual([event.type for event in events], ["accepted", "content_delta", "terminal"])
         self.assertEqual(model.calls, 1)
         self.assertEqual(telemetry.records[0][1]["route"], "qwen")
+
+    def test_slow_qwen_acknowledges_once_from_durable_admission_with_separate_payload_free_timings(self):
+        clock = AdvanceableClock()
+        scheduler = DeterministicScheduler()
+        telemetry = RecordingTelemetry()
+        gateway = TextGateway(
+            FakeModel(chunks=("answer",)), clock, VolatileState(), telemetry, DisabledTools(),
+            SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=scheduler,
+        )
+        events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+
+        self.assertEqual(len(scheduler._calls), 1)
+        accepted = next(events)
+        clock.advance(0.5)
+        scheduler.advance(0.5)
+        acknowledgement = next(events)
+        remainder = list(events)
+
+        self.assertEqual((acknowledgement.type, acknowledgement.message, acknowledgement.content, acknowledgement.outcome), ("ack", "Work is continuing.", None, None))
+        self.assertEqual([event.type for event in (accepted, acknowledgement, *remainder)], ["accepted", "ack", "content_delta", "terminal"])
+        timing = [event for event, _fields in telemetry.records if event != "route_selected"]
+        self.assertEqual(timing, ["acknowledgement", "first_model_token", "first_useful_content", "terminal"])
+        self.assertTrue(all(set(fields) == {"request_id", "session_id", "trace_id", "duration_ms"} for event, fields in telemetry.records if event != "route_selected"))
+        self.assertTrue(all("answer" not in str(fields) for _event, fields in telemetry.records))
+
+    def test_threaded_provider_delivers_ack_before_a_slow_first_model_chunk(self):
+        gateway = TextGateway(
+            FakeModel(chunks=("answer",), delay_seconds=0.65), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(),
+            SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=ThreadingScheduler(), tasks=ThreadingTasks(),
+        )
+        events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+
+        self.assertEqual(next(events).type, "accepted")
+        started = time.monotonic()
+        acknowledgement = next(events)
+
+        self.assertEqual((acknowledgement.type, acknowledgement.message), ("ack", "Work is continuing."))
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertEqual([event.type for event in events], ["content_delta", "terminal"])
+
+    def test_threaded_cancellation_wins_over_a_pending_acknowledgement(self):
+        gateway = TextGateway(
+            FakeModel(chunks=("late",), delay_seconds=0.65), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(),
+            SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=ThreadingScheduler(), tasks=ThreadingTasks(),
+        )
+        events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+
+        accepted = next(events)
+        self.assertEqual(gateway.cancel_request(accepted.request_id)["state"], "cancellation_requested")
+        self.assertEqual([(event.type, event.outcome) for event in events], [("terminal", "cancelled")])
+
+    def test_yielded_acknowledgement_is_fenced_when_cancellation_wins_delivery(self):
+        clock = AdvanceableClock()
+        scheduler = DeterministicScheduler()
+        gateway = TextGateway(
+            FakeModel(chunks=("late",)), clock, VolatileState(), NoopTelemetry(), DisabledTools(),
+            SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=scheduler,
+        )
+        events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+        accepted = next(events)
+        clock.advance(0.5)
+        scheduler.advance(0.5)
+        acknowledgement = next(events)
+
+        self.assertEqual(acknowledgement.type, "ack")
+        self.assertEqual(gateway.cancel_request(accepted.request_id)["state"], "cancellation_requested")
+        delivered: list[object] = []
+        self.assertFalse(gateway.deliver_stream_event(acknowledgement, delivered.append))
+        self.assertEqual(delivered, [])
+
+    def test_scheduler_and_task_start_failures_are_safe_accepted_terminals(self):
+        class RaisingScheduler:
+            def schedule(self, delay_seconds, callback):
+                del delay_seconds, callback
+                raise RuntimeError("scheduler failure")
+
+        class RaisingTasks:
+            def start(self, callback):
+                del callback
+                raise RuntimeError("task failure")
+
+        def stream(scheduler=None, tasks=None):
+            gateway = TextGateway(
+                FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(),
+                ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks,
+            )
+            return list(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+
+        for events in (stream(scheduler=RaisingScheduler()), stream(scheduler=DeterministicScheduler(), tasks=RaisingTasks())):
+            self.assertEqual([(event.type, event.outcome) for event in events], [("accepted", None), ("error", None), ("terminal", "failed")])
+            self.assertEqual(events[1].error["code"], "stream_start_failed")
+
+    def test_http_stream_serializes_one_ack_before_slow_useful_output(self):
+        server = self.with_server(FakeModel(chunks=("answer",), delay_seconds=0.65), scheduler=ThreadingScheduler(), tasks=ThreadingTasks())
+        session = self.create_session(server)
+        connection, response = self.start_turn(server, str(session["session_id"]))
+        try:
+            frames = []
+            while not frames or frames[-1][0] != "terminal":
+                frames.append(self.read_frame(response))
+            self.assertEqual([kind for kind, _payload in frames], ["accepted", "ack", "content_delta", "terminal"])
+            self.assertEqual(frames[1][1]["message"], "Work is continuing.")
+            self.assertEqual([payload["seq"] for _kind, payload in frames], [1, 2, 3, 4])
+        finally:
+            connection.close()
+
+    def test_acknowledgement_keeps_later_failure_and_timeout_terminals_authoritative(self):
+        class FailingModel:
+            def stream(self, input, cancellation):
+                del input, cancellation
+                raise ModelOperationFailure("upstream_failure", "dependency_unavailable", "Model is unavailable.", True)
+
+        def acknowledged_events(model):
+            clock = AdvanceableClock()
+            scheduler = DeterministicScheduler()
+            telemetry = RecordingTelemetry()
+            gateway = TextGateway(
+                model, clock, VolatileState(), telemetry, DisabledTools(), SequentialIds(),
+                ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=scheduler,
+            )
+            events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+            accepted = next(events)
+            clock.advance(0.5)
+            scheduler.advance(0.5)
+            acknowledgement = next(events)
+            return clock, events, accepted, acknowledgement, telemetry
+
+        _clock, failure_events, _accepted, failure_acknowledgement, failure_telemetry = acknowledged_events(FailingModel())
+        self.assertEqual((failure_acknowledgement.type, failure_acknowledgement.message), ("ack", "Work is continuing."))
+        self.assertEqual([(event.type, event.outcome) for event in failure_events], [("error", None), ("terminal", "failed")])
+        self.assertEqual([event for event, _fields in failure_telemetry.records if event != "route_selected"], ["acknowledgement", "terminal"])
+
+        deadline_clock, deadline_events, _accepted, deadline_acknowledgement, deadline_telemetry = acknowledged_events(FakeModel())
+        self.assertEqual((deadline_acknowledgement.type, deadline_acknowledgement.message), ("ack", "Work is continuing."))
+        deadline_clock.advance(30.0)
+        timeout_events = list(deadline_events)
+        self.assertEqual([(event.type, event.error and event.error["code"], event.outcome) for event in timeout_events], [("error", "model_deadline", None), ("terminal", None, "failed")])
+        self.assertEqual([event for event, _fields in deadline_telemetry.records if event != "route_selected"], ["acknowledgement", "terminal"])
+
+    def test_useful_output_cancellation_and_fast_routes_suppress_pending_acknowledgements(self):
+        def gateway_for(model):
+            return TextGateway(
+                model, AdvanceableClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(),
+                ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=DeterministicScheduler(),
+            )
+
+        fast = gateway_for(FakeModel())
+        self.assertEqual([event.type for event in fast.begin_turn(fast.create_session().session_id, {"input": "oriel help"}, self.startup)], ["accepted", "content_delta", "terminal"])
+
+        useful = gateway_for(FakeModel(chunks=("answer",)))
+        useful_events = list(useful.begin_turn(useful.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+        self.assertNotIn("ack", [event.type for event in useful_events])
+
+        class ProposalThenFinish(FakeModel):
+            def __init__(self):
+                super().__init__()
+                self.release = Event()
+
+            def stream(self, input, cancellation):
+                del input, cancellation
+                yield ModelProposal({
+                    "proposal_version": "1.0", "proposal_id": "proposal-1", "action": "sample_action",
+                    "target": "synthetic:sample-target", "arguments": {"values": ["sample"]}, "dry_run": True,
+                    "idempotency": "proposal-1", "deadline": "2030-01-02T12:34:00Z",
+                    "confirmation": {"required": True, "evidence": None},
+                })
+                self.release.wait(1)
+                yield ModelOutcome("completed")
+
+        proposal_clock = AdvanceableClock()
+        proposal_scheduler = DeterministicScheduler()
+        proposal_model = ProposalThenFinish()
+        proposal_gateway = TextGateway(proposal_model, proposal_clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=proposal_scheduler)
+        proposal_events = iter(proposal_gateway.begin_turn(proposal_gateway.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+        self.assertEqual(next(proposal_events).type, "accepted")
+        self.assertEqual(next(proposal_events).type, "proposal")
+        proposal_clock.advance(0.5)
+        proposal_scheduler.advance(0.5)
+        proposal_model.release.set()
+        self.assertEqual([event.type for event in proposal_events], ["terminal"])
+
+        clock = AdvanceableClock()
+        scheduler = DeterministicScheduler()
+        cancelled = TextGateway(FakeModel(), clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=scheduler)
+        pending = iter(cancelled.begin_turn(cancelled.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+        accepted = next(pending)
+        clock.advance(0.5)
+        scheduler.advance(0.5)
+        self.assertEqual(cancelled.cancel_request(accepted.request_id)["state"], "cancellation_requested")
+        self.assertEqual([event.type for event in pending], ["terminal"])
+
+        class OutcomeOnly(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                yield ModelOutcome("completed")
+
+        terminal_clock = AdvanceableClock()
+        terminal_scheduler = DeterministicScheduler()
+        terminal = TextGateway(OutcomeOnly(), terminal_clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), scheduler=terminal_scheduler)
+        terminal_events = list(terminal.begin_turn(terminal.create_session().session_id, {"input": "Explain the answer."}, self.startup))
+        terminal_clock.advance(0.5)
+        terminal_scheduler.advance(0.5)
+        self.assertEqual([event.type for event in terminal_events], ["accepted", "terminal"])
 
     def test_cancelled_turn_keeps_capacity_until_terminal_but_reset_allows_a_new_generation(self):
         gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())

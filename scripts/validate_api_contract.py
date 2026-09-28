@@ -176,7 +176,13 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".type: ack must precede useful content")
             if "outcome" in event:
                 errors.append(loc + ".outcome: ack cannot state completion or approval")
+            if event.get("message") != "Work is continuing.":
+                errors.append(loc + ".message: ack requires the fixed bounded message")
+            for field in set(event) - {"api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq", "message"}:
+                errors.append(loc + f".{field}: ack may only carry its fixed message")
             acked = True
+        elif "message" in event:
+            errors.append(loc + ".message: only ack may carry a message")
         if kind in ("content_delta", "proposal", "validation", "action_state"):
             useful = True
         if kind == "content_delta":
