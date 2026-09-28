@@ -51,15 +51,34 @@ python3 scripts/demo_text_gateway.py --self-test
 
 It prints stable JSON for `/live`, `/ready`, and an internal fake-model text
 turn. To exercise the public stream locally, start `python3 -m oriel`, then in
-another terminal create a session and submit a turn:
+another terminal use the dependency-free reference client:
 
 ```sh
-curl -s -X POST http://127.0.0.1:8080/v1/sessions
-curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
-  -H 'content-type: application/json' --data '{"input":"hello"}'
-curl -s -X POST http://127.0.0.1:8080/v1/requests/<request_id>/cancel
-curl -s http://127.0.0.1:8080/v1/requests/<request_id>
+python3 scripts/text_client.py start 'hello'
+# Copy the displayed session_id to continue an existing session.
+python3 scripts/text_client.py continue <session_id> 'another question'
+# Copy the displayed request_id to request cancellation or inspect it passively.
+python3 scripts/text_client.py cancel <request_id>
+python3 scripts/text_client.py status <request_id>
 ```
+
+Pass `--endpoint http://host:port` before the subcommand for another local
+gateway address. `start` creates a session and submits its first turn;
+`continue` submits a turn to the supplied session. The client prints
+`accepted` identifiers immediately, labels the optional acknowledgement apart
+from streamed answer text, and reports the final typed terminal outcome. A
+proposal is always labelled `UNTRUSTED DRY-RUN`; it is a proposal, never a
+completed action.
+
+If a stream ends after `accepted` but before `terminal`, the client performs
+one passive `status` lookup for that request and does not replay the turn. If
+the stream ends before `accepted`, it reports `outcome_unknown` and does not
+make a status request or resend the POST. HTTP errors, cancellation responses,
+and status responses are rendered from their structured fields. For an easy
+local disconnection/recovery exercise, stop the client after it prints its
+`accepted` line and run `python3 scripts/text_client.py status <request_id>`;
+the gateway treats the disconnected stream as cancellation, so its eventual
+terminal status is authoritative.
 
 Session context is volatile and isolated by its opaque session handle. A first
 turn may supply `context`; later turns use the retained transcript only. Reset
