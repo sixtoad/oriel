@@ -67,6 +67,13 @@ class ApiContractTests(unittest.TestCase):
         over_content = copy.deepcopy(valid)
         over_content[2]["content"] = "x" * 65537
         self.assertIn("cumulative streamed", "\n".join(validate_stream(over_content)))
+        proposal_stream = copy.deepcopy(valid)
+        proposal_stream[2].pop("content")
+        proposal_stream[2]["type"] = "proposal"
+        proposal_stream[2]["proposal"] = load_json(EXAMPLES / "valid" / "generic-action.json")["proposal"]
+        self.assertEqual(validate_stream(proposal_stream), [])
+        proposal_stream[2].pop("proposal")
+        self.assertIn("requires proposal", "\n".join(validate_stream(proposal_stream)))
 
     def test_closed_documents_and_caps_reject_extensions_or_overflow(self):
         config = load_json(EXAMPLES / "valid" / "config-precedence.json")
@@ -130,6 +137,17 @@ class ApiContractTests(unittest.TestCase):
                 self.assertNotIn(forbidden, public)
         config = load_json(API / "schemas" / "config.json")
         self.assertEqual(set(config["properties"]["provider"]["properties"]), {"connection_ref"})
+
+    def test_health_schema_requires_components_for_readiness_and_codes_for_unready_components(self):
+        health = load_json(API / "schemas" / "health.json")
+        self.assertEqual(health["allOf"][0]["then"]["required"], ["components"])
+        self.assertEqual(health["allOf"][1]["then"]["required"], ["code", "components"])
+        self.assertEqual(health["allOf"][2]["then"]["not"]["anyOf"], [{"required": ["code"]}, {"required": ["components"]}])
+        ready_components = health["allOf"][0]["then"]["properties"]["components"]["properties"]
+        self.assertEqual(ready_components["core"]["properties"]["state"], {"const": "ready"})
+        self.assertEqual(ready_components["model"]["properties"]["state"], {"const": "ready"})
+        required_component = health["$defs"]["required_component"]
+        self.assertEqual(required_component["allOf"][0]["then"]["required"], ["code"])
 
     def test_loader_never_echoes_malformed_or_private_input(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,8 +11,8 @@ paths:
   /ready:
     get:
       responses:
-        '200': {description: Core configuration is ready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
-        '503': {description: Core configuration is unready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+        '200': {description: Core configuration and model are ready; components include optional HA state, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+        '503': {description: Core configuration or model is unready; optional HA alone does not make chat unready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
   /v1/sessions:
     post:
       responses:
@@ -29,6 +29,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '429': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /v1/sessions/{session_id}/reset:
     post:
       parameters: [{$ref: '#/components/parameters/SessionId'}]
@@ -47,14 +48,15 @@ paths:
     post:
       parameters: [{$ref: '#/components/parameters/RequestId'}]
       responses:
-        '202': {description: Cancellation acknowledgement; a terminal race reports already_terminal and its outcome, content: {application/json: {schema: {$ref: './schemas/cancellation.json'}}}}
+        '202': {description: Cancellation acknowledgement; repeat live cancellation remains cancellation_requested, and a terminal race reports already_terminal with its outcome, content: {application/json: {schema: {$ref: './schemas/cancellation.json'}}}}
         '404': {$ref: '#/components/responses/Error'}
-        '409': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
   /v1/requests/{request_id}:
     get:
       parameters: [{$ref: '#/components/parameters/RequestId'}]
       responses:
         '200': {description: Passive request status; it never starts or replays work, content: {application/json: {schema: {$ref: './schemas/request-status.json'}}}}
+        '503': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
 components:
   parameters:

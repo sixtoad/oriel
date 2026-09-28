@@ -100,6 +100,16 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 path,
             )
 
+    def test_fast_router_is_a_pure_application_module(self):
+        path = PACKAGE / "application" / "fast_router.py"
+        self.assertFalse(any(module.startswith("oriel.adapters") for module in imported_modules(path)))
+        self.assertEqual(dynamic_imports(path), set())
+
+    def test_configuration_owner_has_no_model_or_tool_control_path(self):
+        source = (PACKAGE / "application" / "configuration.py").read_text(encoding="utf-8")
+        for prohibited in ("ModelPort", "ToolPort", "dispatch(", "stream(", "respond("):
+            self.assertNotIn(prohibited, source)
+
     def test_inward_rings_reject_dynamic_and_infrastructure_imports(self):
         for ring in ("domain", "application"):
             for path in sorted((PACKAGE / ring).glob("*.py")):

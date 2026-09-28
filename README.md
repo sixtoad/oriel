@@ -57,13 +57,49 @@ another terminal create a session and submit a turn:
 curl -s -X POST http://127.0.0.1:8080/v1/sessions
 curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
   -H 'content-type: application/json' --data '{"input":"hello"}'
+curl -s -X POST http://127.0.0.1:8080/v1/requests/<request_id>/cancel
 curl -s http://127.0.0.1:8080/v1/requests/<request_id>
 ```
 
+Session context is volatile and isolated by its opaque session handle. A first
+turn may supply `context`; later turns use the retained transcript only. Reset
+it with `POST /v1/sessions/<session_id>/reset`, which returns the next context
+generation, or remove it with `DELETE /v1/sessions/<session_id>`. The runtime
+cleans up sessions after 30 minutes idle or 24 hours total lifetime.
+
 The stream starts with `accepted`, emits ordered `content_delta` events, and
-ends with one `terminal` event. Status lookup is passive and never replays a
-turn. The bootstrap uses the packaged non-secret fixture, makes no provider or
-Home Assistant call, and stores nothing persistently.
+ends with one `terminal` event. Cancelling a live request returns
+`cancellation_requested`; a repeated request is safe, and a completed race
+returns `already_terminal` with its outcome. A disconnected stream is
+cancelled. Status lookup is passive and is the reconnect path; it never
+replays a turn. Cancellation asks a local upstream to stop cooperatively, but
+the gateway still discards late upstream output if it cannot be interrupted
+immediately. Session context remains volatile. The runtime stores only request
+correlation metadata and terminal outcomes in a local owner-only SQLite ledger
+for 24 hours; it never stores prompts, context, model output, credentials, or
+action material. Its path defaults to `oriel-request-ledger.sqlite3` and can be
+selected with `python3 -m oriel --ledger /path/to/ledger.sqlite3`. The bootstrap
+uses the packaged non-secret fixture and makes no provider or Home Assistant call.
+
+Before a model call, the gateway also applies deterministic fast rules. `oriel help`
+returns a fixed local response. Ambiguous control language asks for clarification;
+live weather, time, music, and home-state requests state that those capabilities are unsupported;
+protected or multiple-action language is denied. `create a synthetic proposal` emits
+one dry-run generic proposal and never dispatches a tool. All other text continues to
+the configured model. These rules do not use the evaluation corpus or expose its
+fixture identifiers or state through the API.
+
+## Configuration activation
+
+Configuration is selected as one whole document: `--config`, then
+`ORIEL_CONFIG_PATH`, then the packaged default. It is strictly validated and
+activated once at process start by revision. The provider `connection_ref` is
+opaque; only the composition root resolves it to an adapter-private profile.
+Changing that profile mapping takes effect after restart, never by rewiring a
+running process. The available effective configuration view is sanitized to
+the API version, active revision, provider readiness/profile label, and names
+of disabled optional skills; it never contains a reference, endpoint,
+credential, header, or model setting.
 
 ## Mutation testing
 

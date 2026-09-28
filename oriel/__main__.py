@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from http.client import HTTPConnection
+from typing import Callable, Mapping
 
-from .adapters.bootstrap import DisabledTools, FakeModel, FixedClock, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
-from .adapters.configuration import load_startup
+from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
+from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver
 from .adapters.http import HealthServer
+from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
+from .adapters.request_ledger import SQLiteRequestLedger
+from .application.configuration import ConfigurationService
+from .application.ports import CancellationSignal, ModelInput, ModelMessage, RequestLedgerUnavailable
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION
 
@@ -23,10 +29,59 @@ def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
         connection.close()
 
 
+def _compose_startup(
+    config_path: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    model_probe: Callable[[object], bool] | None = None,
+    optional_ha_probe: Callable[[], bool] | None = None,
+):
+    """Select the one local profile resolver and activate configuration once."""
+    configuration = ConfigurationService(ThreadSafeSynchronization())
+    try:
+        resolver = provider_profile_resolver(environ)
+    except ProfileUnavailable:
+        # Preserve the config adapter's sanitized unavailable-profile outcome.
+        resolver = _UnavailableProfileResolver()
+    return activate_startup(
+        configuration,
+        resolver,
+        explicit_path=config_path,
+        environ=environ,
+        model_probe=model_probe or (lambda profile: _model_ready(profile, environ)),
+        optional_ha_probe=optional_ha_probe,
+    )
+
+
+class _UnavailableProfileResolver:
+    def resolve(self, connection_ref: str):
+        del connection_ref
+        raise ProfileUnavailable("provider profile is unavailable")
+
+
+def _model_for_profile(profile: object, environ: Mapping[str, str] | None = None):
+    if isinstance(profile, OpenAICompatibleProfile):
+        return OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
+    return FakeModel()
+
+
+def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> bool:
+    """Probe the selected local model through its adapter without publishing provider details."""
+    if isinstance(profile, ResolvedProviderProfile):
+        return True
+    if not isinstance(profile, OpenAICompatibleProfile):
+        return False
+    try:
+        model = OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
+        next(iter(model.stream(ModelInput((ModelMessage("user", "health"),)), CancellationSignal())))
+        return True
+    except Exception:
+        return False
+
+
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
-    startup = load_startup(config_path)
-    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization())
+    startup, _profile = _compose_startup(config_path)
+    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
     server = HealthServer(startup, core)
     server.start()
     try:
@@ -46,19 +101,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--ledger", type=Path, default=Path("oriel-request-ledger.sqlite3"), help="Path to the local durable request-status ledger")
     args = parser.parse_args(argv)
     if args.self_test:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
-    startup = load_startup(args.config)
-    gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization())
+    startup, _profile = _compose_startup(args.config)
+    try:
+        ledger = SQLiteRequestLedger(args.ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
+        gateway.recover_interrupted_requests()
+    except RequestLedgerUnavailable:
+        ledger = UnavailableRequestLedger()
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger)
     server = HealthServer(startup, gateway, args.host, args.port)
+    cleanup = CleanupTrigger(gateway.expire_sessions)
+    cleanup.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
+        cleanup.close()
         server.close()
+        if isinstance(ledger, SQLiteRequestLedger):
+            ledger.close()
     return 0
 
 

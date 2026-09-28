@@ -25,13 +25,58 @@ class ModelOutcome:
     outcome: str
 
 
-ModelStreamItem = ModelChunk | ModelOutcome
+@dataclass(frozen=True)
+class ModelProposal:
+    """One untrusted, provider-neutral generic proposal from a model stream."""
+
+    proposal: Mapping[str, object]
+
+
+ModelStreamItem = ModelChunk | ModelOutcome | ModelProposal
+
+
+@dataclass(frozen=True)
+class ModelMessage:
+    """One attributed conversation message supplied to a model adapter."""
+
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
+class ModelInput:
+    """The complete bounded transcript for one isolated model turn."""
+
+    messages: tuple[ModelMessage, ...]
+
+
+@dataclass
+class CancellationSignal:
+    """Application-owned cooperative cancellation intent for one live turn."""
+
+    _cancelled: bool = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
 
 
 class StreamingModelPort(Protocol):
     """Produces bounded text pieces and one explicit outcome for an admitted turn."""
 
-    def stream(self, text: str) -> Iterable[ModelStreamItem]: ...
+    def stream(self, input: ModelInput, cancellation: CancellationSignal) -> Iterable[ModelStreamItem]: ...
+
+
+@dataclass(frozen=True)
+class ModelOperationFailure(RuntimeError):
+    """A sanitized, provider-neutral failure from one bounded model operation."""
+
+    code: str
+    category: str
+    message: str
+    retryable: bool = True
 
 
 class IdentifierPort(Protocol):
@@ -45,11 +90,23 @@ class SynchronizationPort(Protocol):
 
     def locked(self) -> ContextManager[None]: ...
 
+    def model_start_locked(self) -> ContextManager[None]: ...
+
+    def wait(self, timeout: float | None = None) -> None: ...
+
+    def notify_all(self) -> None: ...
+
 
 class Clock(Protocol):
     """Supplies an opaque timestamp for local state and telemetry."""
 
     def now(self) -> str: ...
+
+
+class MonotonicClock(Protocol):
+    """Supplies monotonic seconds for volatile lifecycle decisions."""
+
+    def monotonic(self) -> float: ...
 
 
 class StatePort(Protocol):
@@ -58,10 +115,62 @@ class StatePort(Protocol):
     def record_turn(self, input_text: str, output_text: str, occurred_at: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class RequestStatusRecord:
+    """The payload-free durable correlation state for one admitted turn."""
+
+    request_id: str
+    session_id: str
+    trace_id: str
+    context_generation: int
+    state: str
+    outcome: str | None
+    admitted_at: str
+    expires_at: str
+
+
+class RequestLedgerUnavailable(RuntimeError):
+    """A storage adapter could not complete a durable ledger operation."""
+
+
+class RequestLedgerPort(Protocol):
+    """Durably reserves and reports server-generated request identities."""
+
+    def reserve(self, record: RequestStatusRecord) -> None: ...
+
+    def mark_terminal(self, request_id: str, outcome: str) -> None: ...
+
+    def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None: ...
+
+    def recover_interrupted(self) -> None: ...
+
+
 class TelemetryPort(Protocol):
     """Receives bounded operational facts without defining their storage."""
 
     def emit(self, event: str, fields: Mapping[str, str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class RouteTelemetry:
+    """Payload-free, correlated facts emitted once for one routing decision."""
+
+    request_id: str
+    session_id: str
+    trace_id: str
+    route: str
+    rule_revision: str
+    duration_ms: int
+
+    def fields(self) -> Mapping[str, str]:
+        return {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "trace_id": self.trace_id,
+            "route": self.route,
+            "rule_revision": self.rule_revision,
+            "duration_ms": str(self.duration_ms),
+        }
 
 
 class ToolPort(Protocol):

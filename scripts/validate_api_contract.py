@@ -186,6 +186,11 @@ def validate_stream(events, path="events"):
                 streamed_content_bytes += _utf8_bytes(event["content"])
                 if streamed_content_bytes > LIMITS["streamed_content_bytes"]:
                     errors.append(loc + ".content: cumulative streamed content exceeds cap")
+        if kind == "proposal":
+            if "proposal" not in event:
+                errors.append(loc + ".proposal: proposal event requires proposal")
+            else:
+                _validate_proposal(event["proposal"], loc + ".proposal", errors)
         if kind == "error":
             if "error" not in event:
                 errors.append(loc + ".error: error event requires error")
