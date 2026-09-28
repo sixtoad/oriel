@@ -90,6 +90,8 @@ class SynchronizationPort(Protocol):
 
     def locked(self) -> ContextManager[None]: ...
 
+    def model_start_locked(self) -> ContextManager[None]: ...
+
     def wait(self, timeout: float | None = None) -> None: ...
 
     def notify_all(self) -> None: ...
@@ -147,6 +149,28 @@ class TelemetryPort(Protocol):
     """Receives bounded operational facts without defining their storage."""
 
     def emit(self, event: str, fields: Mapping[str, str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class RouteTelemetry:
+    """Payload-free, correlated facts emitted once for one routing decision."""
+
+    request_id: str
+    session_id: str
+    trace_id: str
+    route: str
+    rule_revision: str
+    duration_ms: int
+
+    def fields(self) -> Mapping[str, str]:
+        return {
+            "request_id": self.request_id,
+            "session_id": self.session_id,
+            "trace_id": self.trace_id,
+            "route": self.route,
+            "rule_revision": self.rule_revision,
+            "duration_ms": str(self.duration_ms),
+        }
 
 
 class ToolPort(Protocol):

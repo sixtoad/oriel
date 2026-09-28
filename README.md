@@ -81,6 +81,14 @@ action material. Its path defaults to `oriel-request-ledger.sqlite3` and can be
 selected with `python3 -m oriel --ledger /path/to/ledger.sqlite3`. The bootstrap
 uses the packaged non-secret fixture and makes no provider or Home Assistant call.
 
+Before a model call, the gateway also applies deterministic fast rules. `oriel help`
+returns a fixed local response. Ambiguous control language asks for clarification;
+live weather, time, music, and home-state requests state that those capabilities are unsupported;
+protected or multiple-action language is denied. `create a synthetic proposal` emits
+one dry-run generic proposal and never dispatches a tool. All other text continues to
+the configured model. These rules do not use the evaluation corpus or expose its
+fixture identifiers or state through the API.
+
 ## Configuration activation
 
 Configuration is selected as one whole document: `--config`, then

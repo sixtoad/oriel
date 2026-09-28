@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import secrets
-from threading import Condition, Event, RLock, Thread
+from threading import Condition, Event, Lock, RLock, Thread
 import time
 from typing import Callable, Iterable, Mapping
 
@@ -61,9 +61,13 @@ class ThreadSafeSynchronization:
 
     def __init__(self) -> None:
         self._lock = Condition(RLock())
+        self._model_start_lock = Lock()
 
     def locked(self) -> Condition:
         return self._lock
+
+    def model_start_locked(self) -> Lock:
+        return self._model_start_lock
 
     def wait(self, timeout: float | None = None) -> None:
         self._lock.wait(timeout)
@@ -219,6 +223,16 @@ class NoopTelemetry:
 
     def emit(self, event: str, fields: Mapping[str, str]) -> None:
         del event, fields
+
+
+@dataclass
+class RecordingTelemetry:
+    """Deterministic payload-free telemetry capture for focused tests."""
+
+    records: list[tuple[str, Mapping[str, str]]] = field(default_factory=list)
+
+    def emit(self, event: str, fields: Mapping[str, str]) -> None:
+        self.records.append((event, dict(fields)))
 
 
 class ToolDenied(RuntimeError):

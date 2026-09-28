@@ -10,13 +10,15 @@ import tempfile
 import time
 from threading import Event, Thread
 import unittest
+from unittest.mock import patch
 
-from oriel.adapters.bootstrap import AdvanceableClock, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
+from oriel.adapters.bootstrap import AdvanceableClock, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RecordingTelemetry, SecureIds, SequentialIds, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
 from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, RequestLedgerUnavailable
+from oriel.application.fast_router import FastRoute
 from oriel.application.text_gateway import AdmissionError, TextGateway
 
 
@@ -42,6 +44,20 @@ class ExplodingModel(FakeModel):
         del input, cancellation
         raise RuntimeError("private provider detail")
         yield ModelChunk("")
+
+
+class RecordingTools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def dispatch(self, name: str, arguments: object) -> None:
+        self.calls.append((name, arguments))
+
+
+class FailingTelemetry:
+    def emit(self, event: str, fields: object) -> None:
+        del event, fields
+        raise RuntimeError("telemetry is unavailable")
 
 
 class StreamingHttpTests(unittest.TestCase):
@@ -166,6 +182,104 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(model.calls, 1)
         self.assertEqual(gateway.request_status(accepted.request_id)["state"], "terminal")
 
+    def test_fast_routes_preserve_stream_transcript_telemetry_and_zero_dispatch(self):
+        model = CountingModel(response="model reply")
+        telemetry = RecordingTelemetry()
+        tools = RecordingTools()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), telemetry, tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+
+        session = gateway.create_session()
+        safe = list(gateway.begin_turn(session.session_id, {"input": "  ORIEL\tHELP! "}, self.startup))
+        self.assertEqual([(event.type, event.content, event.outcome) for event in safe], [("accepted", None, None), ("content_delta", "Oriel can provide limited deterministic responses.", None), ("terminal", None, "completed")])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual([(message.role, message.content) for message in gateway._sessions[session.session_id].transcript], [("user", "  ORIEL\tHELP! "), ("assistant", "Oriel can provide limited deterministic responses.")])
+
+        self.assertEqual(telemetry.records, [("route_selected", {
+            "request_id": safe[0].request_id,
+            "session_id": session.session_id,
+            "trace_id": safe[0].trace_id,
+            "route": "content",
+            "rule_revision": "1",
+            "duration_ms": "0",
+        })])
+        self.assertNotIn("ORIEL", str(telemetry.records))
+        self.assertEqual(tools.calls, [])
+
+    def test_fast_clarification_limitations_denials_and_proposals_do_not_call_model_or_tools(self):
+        model = CountingModel(response="model reply")
+        tools = RecordingTools()
+        telemetry = RecordingTelemetry()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), telemetry, tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+
+        def stream(text: str):
+            return list(gateway.begin_turn(gateway.create_session().session_id, {"input": text}, self.startup))
+
+        clarification = stream("Turn on the desk lamp")
+        limitation = stream("What is the weather now?")
+        home_state = stream("Are the lights on?")
+        denial = stream("Unlock the front door")
+        proposal = stream("Create a synthetic proposal")
+        self.assertEqual([(event.type, event.content, event.outcome) for event in clarification], [("accepted", None, None), ("content_delta", "Please clarify your request.", None), ("terminal", None, "completed")])
+        self.assertEqual(limitation[1].content, "Live weather lookup is unsupported.")
+        self.assertEqual(home_state[1].content, "Live home-state lookup is unsupported.")
+        self.assertEqual([(event.type, event.error and event.error["category"], event.outcome) for event in denial], [("accepted", None, None), ("error", "policy_denial", None), ("terminal", None, "denied")])
+        self.assertEqual([event.type for event in proposal], ["accepted", "proposal", "terminal"])
+        self.assertEqual(proposal[-1].outcome, "completed")
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(tools.calls, [])
+        self.assertEqual(
+            telemetry.records,
+            [
+                (
+                    "route_selected",
+                    {
+                        "request_id": events[0].request_id,
+                        "session_id": events[0].session_id,
+                        "trace_id": events[0].trace_id,
+                        "route": route,
+                        "rule_revision": "1",
+                        "duration_ms": "0",
+                    },
+                )
+                for events, route in (
+                    (clarification, "clarification"),
+                    (limitation, "limitation"),
+                    (home_state, "limitation"),
+                    (denial, "denial"),
+                    (proposal, "proposal"),
+                )
+            ],
+        )
+
+    def test_route_telemetry_failure_does_not_strand_an_accepted_turn(self):
+        gateway = TextGateway(CountingModel(), FixedClock(), VolatileState(), FailingTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+
+        events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": "oriel help"}, self.startup))
+
+        self.assertEqual([(event.type, event.outcome) for event in events], [("accepted", None), ("content_delta", None), ("terminal", "completed")])
+        self.assertEqual(gateway.request_status(events[0].request_id)["state"], "terminal")
+
+    def test_invalid_fast_proposal_is_denied_without_model_or_tool_dispatch(self):
+        model = CountingModel(response="model reply")
+        tools = RecordingTools()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        with patch("oriel.application.text_gateway.select_fast_route", return_value=FastRoute("proposal", proposal={"invalid": True})):
+            events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": "any text"}, self.startup))
+
+        self.assertEqual([(event.type, event.error and event.error["category"], event.outcome) for event in events], [("accepted", None, None), ("error", "policy_denial", None), ("terminal", None, "denied")])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(tools.calls, [])
+
+    def test_complex_chat_reaches_qwen_route_after_payload_free_telemetry(self):
+        model = CountingModel(response="model reply")
+        telemetry = RecordingTelemetry()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), telemetry, DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": "Explain why the sky looks blue."}, self.startup))
+
+        self.assertEqual([event.type for event in events], ["accepted", "content_delta", "terminal"])
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(telemetry.records[0][1]["route"], "qwen")
+
     def test_cancelled_turn_keeps_capacity_until_terminal_but_reset_allows_a_new_generation(self):
         gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
         first = gateway.create_session()
@@ -240,6 +354,112 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(fourth_events[-1].outcome, "completed")
         self.assertEqual(fifth_events[-1].outcome, "completed")
         self.assertEqual(model.inputs[2:], ["four", "five"])
+
+    def test_later_queued_provider_waits_for_an_earlier_queued_provider_to_start(self):
+        class CoordinatedModel(FakeModel):
+            def __init__(self):
+                super().__init__()
+                self.initial_started = Event()
+                self.release_initial = Event()
+                self.fourth_entered = Event()
+                self.finish_fourth = Event()
+                self.fifth_entered = Event()
+                self.finish_fifth = Event()
+                self._initial_inputs: list[str] = []
+
+            def stream(self, input, cancellation):
+                text = input.messages[-1].content
+                if text in {"one", "two"}:
+                    self._initial_inputs.append(text)
+                    if len(self._initial_inputs) == 2:
+                        self.initial_started.set()
+                    self.release_initial.wait(1)
+                elif text == "four":
+                    self.fourth_entered.set()
+                    self.finish_fourth.wait(1)
+                elif text == "five":
+                    self.fifth_entered.set()
+                    self.finish_fifth.wait(1)
+                if not cancellation.is_cancelled():
+                    yield ModelOutcome("completed")
+
+        model = CoordinatedModel()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        sessions = [gateway.create_session() for _ in range(5)]
+        streams = [iter(gateway.begin_turn(session.session_id, {"input": text}, self.startup)) for session, text in zip(sessions, ("one", "two", "three", "four", "five"), strict=True)]
+        accepted = [next(stream) for stream in streams]
+        active = [Thread(target=lambda stream=stream: list(stream), daemon=True) for stream in streams[:2]]
+        for thread in active:
+            thread.start()
+        self.assertTrue(model.initial_started.wait(0.25))
+
+        cancelled_events: list[object] = []
+        cancelled_thread = Thread(target=lambda: cancelled_events.extend(streams[2]), daemon=True)
+        cancelled_thread.start()
+        self.assertEqual(gateway.cancel_request(accepted[2].request_id)["state"], "cancellation_requested")
+        cancelled_thread.join(0.25)
+        self.assertFalse(cancelled_thread.is_alive())
+        self.assertEqual([(event.type, event.outcome) for event in cancelled_events], [("terminal", "cancelled")])
+
+        fifth_events: list[object] = []
+        fifth_thread = Thread(target=lambda: fifth_events.extend(streams[4]), daemon=True)
+        fifth_thread.start()
+        model.release_initial.set()
+        for thread in active:
+            thread.join(0.25)
+        self.assertFalse(any(thread.is_alive() for thread in active))
+        self.assertFalse(model.fifth_entered.wait(0.1))
+
+        fourth_events: list[object] = []
+        fourth_thread = Thread(target=lambda: fourth_events.extend(streams[3]), daemon=True)
+        fourth_thread.start()
+        self.assertTrue(model.fourth_entered.wait(0.25))
+        self.assertFalse(model.fifth_entered.is_set())
+        model.finish_fourth.set()
+        self.assertTrue(model.fifth_entered.wait(0.25))
+        model.finish_fifth.set()
+        fourth_thread.join(0.25)
+        fifth_thread.join(0.25)
+        self.assertEqual(fourth_events[-1].outcome, "completed")
+        self.assertEqual(fifth_events[-1].outcome, "completed")
+
+    def test_unconsumed_cancelled_queue_entry_does_not_block_later_provider_start(self):
+        class BlockingModel(FakeModel):
+            def __init__(self):
+                super().__init__()
+                self.started = Event()
+                self.release = Event()
+                self.inputs: list[str] = []
+
+            def stream(self, input, cancellation):
+                self.inputs.append(input.messages[-1].content)
+                self.started.set()
+                self.release.wait(1)
+                if not cancellation.is_cancelled():
+                    yield ModelOutcome("completed")
+
+        model = BlockingModel()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        sessions = [gateway.create_session() for _ in range(4)]
+        streams = [iter(gateway.begin_turn(session.session_id, {"input": text}, self.startup)) for session, text in zip(sessions, ("one", "two", "three", "four"), strict=True)]
+        accepted = [next(stream) for stream in streams]
+        active = [Thread(target=lambda stream=stream: list(stream), daemon=True) for stream in streams[:2]]
+        for thread in active:
+            thread.start()
+        self.assertTrue(model.started.wait(0.25))
+        self.assertEqual(gateway.cancel_request(accepted[2].request_id)["state"], "cancellation_requested")
+
+        later_events: list[object] = []
+        later = Thread(target=lambda: later_events.extend(streams[3]), daemon=True)
+        later.start()
+        model.release.set()
+        for thread in active:
+            thread.join(1)
+        later.join(1)
+
+        self.assertFalse(later.is_alive())
+        self.assertEqual(model.inputs, ["one", "two", "four"])
+        self.assertEqual(later_events[-1].outcome, "completed")
 
     def test_expired_queued_turn_fails_without_opening_a_third_model_stream(self):
         class BlockingModel(FakeModel):

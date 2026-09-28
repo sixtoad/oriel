@@ -26,6 +26,12 @@ Configuration is an immutable restart-applied document. The explicit `--config` 
 
 The manifest, proposal, and result grammar is generic and versioned. Targets are synthetic, every manifest action is disabled by default, and proposals carry a deadline, dry-run flag, idempotency key, and confirmation evidence. These artifacts select no real operation, target, provider, endpoint, or credential.
 
+## Deterministic fast responses
+
+After durable admission and before model work, the gateway applies a fixed application-owned router revision to normalized bounded input and retained bounded context. Its supported exact request is `oriel help`; it completes with deterministic content and never calls a model. Ambiguous control requests complete with `Please clarify your request.` Unsupported live weather, time, music, and home-state requests complete with an explicit limitation. Protected or multiple-action language emits a typed policy denial and `terminal: denied`. The exact request `create a synthetic proposal` may emit one validated, dry-run generic synthetic proposal through the same proposal boundary used by model output; it never dispatches a tool. Other requests use the configured model route.
+
+Each routed turn emits one correlated payload-free route record containing the route, rule revision, and routing duration. The router never exposes evaluator fixtures, selects a real action or target, fabricates live state, changes request identities, or alters the stream schema.
+
 ## Evidence procedure
 
 Run `python3 scripts/validate_api_contract.py api/examples` offline. Run `python3 scripts/sse_probe.py --self-test` to obtain local direct-delivery and disconnect evidence. A supported direct and Ingress placement must each run the probe and retain only sanitized timing/outcome evidence. Until an Ingress run is recorded, Ingress evidence is incomplete; the local self-test is not a gateway or Ingress result.
