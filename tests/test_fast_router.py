@@ -27,18 +27,23 @@ class FastRouterTests(unittest.TestCase):
         self.assertEqual(route("Play music", ()).content, "Music playback is unsupported.")
         self.assertEqual(route("Are the lights on?", ()).content, "Live home-state lookup is unsupported.")
         self.assertEqual(route("The kitchen lights, are they on?", ()).content, "Live home-state lookup is unsupported.")
+        for question in ("Explain weather patterns.", "How does music playback work?", "Why is a door open?"):
+            self.assertEqual(route(question, ()).route, "qwen")
 
     def test_protected_and_multiple_action_language_is_a_typed_denial(self) -> None:
         for request in ("Unlock the front door", "Turn on the kitchen light and turn off the hallway light", "Pause music then play a song"):
             decision = route(request, ())
             self.assertEqual((decision.route, decision.error_code, decision.error_category), ("denial", "fast_route_denied", "policy_denial"))
+        self.assertEqual(route("Explain how to turn on and turn off a light.", ()).route, "qwen")
+        self.assertEqual(route("Turn on the desk lamp because it is dark.", ()).route, "clarification")
 
     def test_only_the_explicit_generic_rule_can_emit_a_valid_synthetic_proposal(self) -> None:
-        decision = route("Create a synthetic proposal.", ())
+        decision = route("Create a synthetic proposal.", (), "2035-01-01T00:05:00Z")
 
         self.assertEqual(decision.route, "proposal")
         self.assertIsNotNone(decision.proposal)
         self.assertTrue(validate_proposal(decision.proposal))
+        self.assertEqual(decision.proposal["deadline"], "2035-01-01T00:05:00Z")
         self.assertEqual(route("Write a proposal for my living room light", ()).route, "qwen")
 
     def test_complex_chat_is_explicitly_deferred_to_qwen(self) -> None:

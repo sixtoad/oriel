@@ -269,16 +269,8 @@ class TextGateway:
 
     def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...]) -> Iterator[StreamEvent]:
         yield self._event(request, "accepted")
-        admission = self._await_start(request)
-        if admission == "cancelled":
-            yield self._terminal(request, "cancelled")
-            return
-        if admission == "deadline":
-            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
-            yield self._terminal(request, "failed")
-            return
         route_started = self._monotonic()
-        decision = select_fast_route(text, model_input.messages[:-1])
+        decision = select_fast_route(text, model_input.messages[:-1], self._proposal_deadline())
         duration_ms = max(0, round((self._monotonic() - route_started) * 1000))
         try:
             self._telemetry.emit("route_selected", RouteTelemetry(request.request_id, request.session_id, request.trace_id, decision.route, decision.rule_revision, duration_ms).fields())
@@ -286,6 +278,14 @@ class TextGateway:
             pass
         if decision.route != "qwen":
             yield from self._stream_fast_route(request, text, supplied_context, decision)
+            return
+        admission = self._await_start(request)
+        if admission == "cancelled":
+            yield self._terminal(request, "cancelled")
+            return
+        if admission == "deadline":
+            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+            yield self._terminal(request, "failed")
             return
         try:
             model = self._model
@@ -298,7 +298,7 @@ class TextGateway:
             saw_proposal = False
             streamed_bytes = 0
             response_parts: list[str] = []
-            provider_stream = iter(model.stream(model_input, request.cancellation))  # type: ignore[union-attr]
+            provider_stream: Iterator[object] | None = None
             first_provider_item = True
             while True:
                 if self._is_fenced(request):
@@ -310,12 +310,10 @@ class TextGateway:
                     return
                 try:
                     if first_provider_item and request.queued_at_admission:
-                        # A generator may begin provider work only on its first next().
-                        # Serialize that boundary for queued work so two simultaneous
-                        # promotions cannot reverse their FIFO start order.
-                        item = self._start_queued_provider_stream(request, provider_stream)
+                        provider_stream = self._start_queued_provider_stream(request, model, model_input)
                     else:
-                        item = next(provider_stream)
+                        provider_stream = iter(model.stream(model_input, request.cancellation)) if provider_stream is None else provider_stream  # type: ignore[union-attr]
+                    item = next(provider_stream)
                     first_provider_item = False
                 except StopIteration:
                     if self._is_fenced(request):
@@ -428,10 +426,6 @@ class TextGateway:
         if self._is_fenced(request):
             yield self._terminal(request, "cancelled")
             return
-        if self._deadline_expired(request):
-            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
-            yield self._terminal(request, "failed")
-            return
         if decision.route == "denial":
             yield self._error(request, decision.error_code or "fast_route_denied", decision.error_category or "policy_denial", decision.error_message or "This request is not allowed.", False)
             yield self._terminal(request, "denied")
@@ -443,7 +437,7 @@ class TextGateway:
                 yield self._terminal(request, "denied")
                 return
             yield proposal
-            result, terminal = self._complete_turn(request, text, supplied_context, "")
+            result, terminal = self._complete_turn(request, text, supplied_context, "", enforce_deadline=False)
         else:
             content = decision.content
             if decision.route not in {"content", "clarification", "limitation"} or content is None:
@@ -455,7 +449,7 @@ class TextGateway:
                 yield self._terminal(request, "cancelled")
                 return
             yield delta
-            result, terminal = self._complete_turn(request, text, supplied_context, content)
+            result, terminal = self._complete_turn(request, text, supplied_context, content, enforce_deadline=False)
         if result == "fenced":
             yield self._terminal(request, "cancelled")
         elif result == "deadline":
@@ -516,11 +510,11 @@ class TextGateway:
             return None
         return self._proposal_event(request, proposal)
 
-    def _complete_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str) -> tuple[str, StreamEvent | None]:
+    def _complete_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str, enforce_deadline: bool = True) -> tuple[str, StreamEvent | None]:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
                 return "fenced", None
-            if self._deadline_expired_locked(request):
+            if enforce_deadline and self._deadline_expired_locked(request):
                 return "deadline", None
             session = self._sessions[request.session_id]
             updated = (*(session.transcript or supplied_context), ModelMessage("user", text), ModelMessage("assistant", response))
@@ -562,8 +556,13 @@ class TextGateway:
     def _deadline_expired_locked(self, request: _Request) -> bool:
         return self._monotonic() >= request.deadline_at
 
-    def _start_queued_provider_stream(self, request: _Request, provider_stream: Iterator[object]) -> object:
-        """Enter the first provider read in admission order for queued turns."""
+    def _proposal_deadline(self) -> str:
+        """Bound a synthetic proposal from the injected application clock."""
+        timestamp = datetime.fromisoformat(self._clock.now().replace("Z", "+00:00"))
+        return (timestamp + timedelta(minutes=5)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _start_queued_provider_stream(self, request: _Request, model: ModelPort, model_input: ModelInput) -> Iterator[object]:
+        """Acquire FIFO permission before a provider can begin any stream work."""
         with self._synchronization.locked():
             while self._has_earlier_unstarted_queued_request_locked(request):
                 if self._is_fenced_locked(request) or self._deadline_expired_locked(request):
@@ -575,7 +574,7 @@ class TextGateway:
                     raise StopIteration
                 request.provider_start_claimed = True
                 self._synchronization.notify_all()
-            return next(provider_stream)
+            return iter(model.stream(model_input, request.cancellation))  # type: ignore[union-attr]
 
     def _has_earlier_unstarted_queued_request_locked(self, request: _Request) -> bool:
         if request.queued_start_order is None:

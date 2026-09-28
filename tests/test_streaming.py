@@ -205,6 +205,43 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertNotIn("ORIEL", str(telemetry.records))
         self.assertEqual(tools.calls, [])
 
+    def test_fast_route_bypasses_model_queue_and_model_deadline(self):
+        class BlockingModel(FakeModel):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = Event()
+                self.release = Event()
+                self.calls = 0
+
+            def stream(self, input, cancellation):
+                del input
+                self.calls += 1
+                self.started.set()
+                self.release.wait(1)
+                if not cancellation.is_cancelled():
+                    yield ModelOutcome("completed")
+
+        clock = AdvanceableClock()
+        model = BlockingModel()
+        gateway = TextGateway(model, clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=30)
+        sessions = [gateway.create_session() for _ in range(3)]
+        active = [iter(gateway.begin_turn(session.session_id, {"input": text}, self.startup)) for session, text in zip(sessions[:2], ("one", "two"), strict=True)]
+        for stream in active:
+            next(stream)
+        workers = [Thread(target=lambda stream=stream: list(stream), daemon=True) for stream in active]
+        for worker in workers:
+            worker.start()
+        self.assertTrue(model.started.wait(0.25))
+        clock.advance(30)
+
+        fast = list(gateway.begin_turn(sessions[2].session_id, {"input": "oriel help"}, self.startup))
+
+        self.assertEqual([(event.type, event.content, event.outcome) for event in fast], [("accepted", None, None), ("content_delta", "Oriel can provide limited deterministic responses.", None), ("terminal", None, "completed")])
+        self.assertEqual(model.calls, 2)
+        model.release.set()
+        for worker in workers:
+            worker.join(1)
+
     def test_fast_clarification_limitations_denials_and_proposals_do_not_call_model_or_tools(self):
         model = CountingModel(response="model reply")
         tools = RecordingTools()
@@ -380,8 +417,7 @@ class StreamingHttpTests(unittest.TestCase):
                 elif text == "five":
                     self.fifth_entered.set()
                     self.finish_fifth.wait(1)
-                if not cancellation.is_cancelled():
-                    yield ModelOutcome("completed")
+                return [] if cancellation.is_cancelled() else [ModelOutcome("completed")]
 
         model = CoordinatedModel()
         gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
