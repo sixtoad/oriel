@@ -24,7 +24,7 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(
             result.stdout,
-            '{"api_version":"1.0","fake_turn":{"text":"The fake model is ready."},"live":{"api_version":"1.0","state":"live"},"ready":{"api_version":"1.0","state":"ready"}}\n',
+            '{"api_version":"1.0","fake_turn":{"text":"The fake model is ready."},"live":{"api_version":"1.0","state":"live"},"ready":{"api_version":"1.0","components":{"core":{"state":"ready"},"ha":{"state":"disabled"},"model":{"state":"ready"}},"state":"ready"}}\n',
         )
         self.assertEqual(json.loads(result.stdout)["ready"]["state"], "ready")
 

@@ -168,19 +168,20 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(RuntimeClock().monotonic(), 123.5)
 
     def test_active_turn_does_not_idle_expire_and_completion_renews_idle_time(self) -> None:
-        session = self.gateway.create_session()
-        active = iter(self.gateway.begin_turn(session.session_id, {"input": "slow"}, READY))
+        gateway = TextGateway(self.model, self.clock, VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), turn_deadline_seconds=IDLE_SESSION_SECONDS + 1)
+        session = gateway.create_session()
+        active = iter(gateway.begin_turn(session.session_id, {"input": "slow"}, READY))
         next(active)
         self.clock.advance(IDLE_SESSION_SECONDS)
-        self.gateway.expire_sessions()
-        self.assertEqual(self.gateway.request_status("fake-request-2")["state"], "in_progress")
+        gateway.expire_sessions()
+        self.assertEqual(gateway.request_status("fake-request-2")["state"], "in_progress")
         list(active)
         self.clock.advance(IDLE_SESSION_SECONDS - 1)
-        self.gateway.expire_sessions()
-        self.assertIn(session.session_id, self.gateway._sessions)
+        gateway.expire_sessions()
+        self.assertIn(session.session_id, gateway._sessions)
         self.clock.advance(1)
-        self.gateway.expire_sessions()
-        self.assertNotIn(session.session_id, self.gateway._sessions)
+        gateway.expire_sessions()
+        self.assertNotIn(session.session_id, gateway._sessions)
 
     def test_near_limit_response_fails_without_replacing_prior_transcript(self) -> None:
         model = RecordingModel(response="r" * 2000)
