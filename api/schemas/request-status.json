@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/request-status.json",
+  "title": "Oriel 1.0 passive request status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "state"],
+  "properties": {
+    "request_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "session_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "context_generation": {"type": "integer", "minimum": 0},
+    "state": {"enum": ["in_progress", "terminal", "unavailable"]},
+    "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]}
+  },
+  "allOf": [
+    {"if": {"properties": {"state": {"const": "terminal"}}}, "then": {"required": ["outcome"]}},
+    {"if": {"properties": {"state": {"const": "in_progress"}}}, "then": {"not": {"required": ["outcome"]}}},
+    {"if": {"properties": {"state": {"const": "unavailable"}}}, "then": {"not": {"required": ["outcome"]}}}
+  ]
+}

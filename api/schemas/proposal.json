@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/proposal.json",
+  "title": "Oriel 1.0 generic proposal and action state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal_version", "proposal_id", "action", "target", "arguments", "dry_run", "idempotency", "deadline", "confirmation"],
+  "properties": {
+    "proposal_version": {"const": "1.0"},
+    "proposal_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "action": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "target": {"type": "string", "pattern": "^synthetic:[a-z][a-z0-9_-]{0,63}$"},
+    "arguments": {"type": "object", "additionalProperties": false, "required": ["values"], "properties": {"values": {"type": "array", "maxItems": 16, "items": {"type": ["string", "number", "boolean", "null"]}}}},
+    "dry_run": {"type": "boolean"},
+    "idempotency": {"type": "string", "minLength": 1, "maxLength": 128},
+    "deadline": {"$ref": "common.json#/$defs/deadline"},
+    "confirmation": {"type": "object", "additionalProperties": false, "required": ["required", "evidence"], "properties": {"required": {"type": "boolean"}, "evidence": {"type": ["string", "null"], "maxLength": 256}}},
+    "state": {"enum": ["proposed", "validated", "denied", "expired", "cancelled", "failed", "completed"]},
+    "result": {"type": "object", "additionalProperties": false, "required": ["state"], "properties": {"state": {"enum": ["denied", "expired", "cancelled", "failed", "completed"]}, "detail": {"type": "string", "maxLength": 256}}}
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "schema_version": "1.0",
+  "provenance": "captured_sanitized",
+  "corpus": {"id": "oriel-synthetic-baseline", "revision": 2},
+  "component": {"id": "reference-local-qwen-text-backend", "revision": 1},
+  "model": {"id": "reference-local-qwen", "revision": 1},
+  "generation": {"strategy": "temperature-zero", "max_output_tokens": 1024},
+  "conditions": {"load": "single-request"},
+  "resource_profile": "operator-managed-reference",
+  "method": "direct-openai-compatible-text-request",
+  "samples": [
+    {
+      "sample_id": "text-warm-chat-greeting-1",
+      "case": {"id": "chat-greeting", "revision": 2},
+      "population": "text",
+      "thermal": "warm",
+      "terminal": "success",
+      "assessment": {"expected_correct": true, "observed_correct": true, "side_effect_outcome": "none"},
+      "anchor_monotonic_ms": 0,
+      "stages": {
+        "wake": {"unavailable_reason": "text-population"},
+        "end_of_turn": {"unavailable_reason": "direct-text-request"},
+        "final_transcript": {"unavailable_reason": "direct-text-request"},
+        "route": {"unavailable_reason": "direct-backend-request"},
+        "first_model_token": {"unavailable_reason": "non-streaming-client"},
+        "first_useful_content": {"observed_monotonic_ms": 6475.620},
+        "acknowledgement": {"unavailable_reason": "direct-backend-capture"},
+        "first_audio": {"unavailable_reason": "text-population"},
+        "static_validation": {"unavailable_reason": "no-tool-dispatch"},
+        "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "text-population"}
+      }
+    },
+    {
+      "sample_id": "text-warm-chat-greeting-2",
+      "case": {"id": "chat-greeting", "revision": 2},
+      "population": "text",
+      "thermal": "warm",
+      "terminal": "success",
+      "assessment": {"expected_correct": true, "observed_correct": true, "side_effect_outcome": "none"},
+      "anchor_monotonic_ms": 0,
+      "stages": {
+        "wake": {"unavailable_reason": "text-population"},
+        "end_of_turn": {"unavailable_reason": "direct-text-request"},
+        "final_transcript": {"unavailable_reason": "direct-text-request"},
+        "route": {"unavailable_reason": "direct-backend-request"},
+        "first_model_token": {"unavailable_reason": "non-streaming-client"},
+        "first_useful_content": {"observed_monotonic_ms": 6339.210},
+        "acknowledgement": {"unavailable_reason": "direct-backend-capture"},
+        "first_audio": {"unavailable_reason": "text-population"},
+        "static_validation": {"unavailable_reason": "no-tool-dispatch"},
+        "action_completion": {"unavailable_reason": "no-action-expected"},
+        "final_audio": {"unavailable_reason": "text-population"}
+      }
+    },
+    {
+      "sample_id": "voice-warm-assist-entry-not-captured",
+      "case": {"id": "audio-interruption-deferred", "revision": 1},
+      "population": "voice",
+      "thermal": "warm",
+      "terminal": "unsupported",
+      "assessment": {"expected_correct": null, "observed_correct": null, "side_effect_outcome": "not_assessable"},
+      "anchor_monotonic_ms": 0,
+      "stages": {
+        "wake": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "end_of_turn": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "final_transcript": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "route": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "first_model_token": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "first_useful_content": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "acknowledgement": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "first_audio": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "static_validation": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "action_completion": {"unavailable_reason": "assist-entry-uninstrumented"},
+        "final_audio": {"unavailable_reason": "assist-entry-uninstrumented"}
+      }
+    }
+  ]
+}

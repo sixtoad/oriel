@@ -1,0 +1,64 @@
+openapi: 3.1.0
+info:
+  title: Oriel Text API
+  version: '1.0'
+  description: Versioned text-only boundary. JSON is application/json; accepted turns use text/event-stream.
+paths:
+  /live:
+    get:
+      responses:
+        '200': {description: Process liveness, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+  /ready:
+    get:
+      responses:
+        '200': {description: Core configuration is ready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+        '503': {description: Core configuration is unready, content: {application/json: {schema: {$ref: './schemas/health.json'}}}}
+  /v1/sessions:
+    post:
+      responses:
+        '201': {description: Session created, content: {application/json: {schema: {$ref: './schemas/session.json'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+  /v1/sessions/{session_id}/turns:
+    post:
+      parameters: [{$ref: '#/components/parameters/SessionId'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: './schemas/turn.json'}}}}
+      responses:
+        '200': {description: Accepted non-replayable stream, content: {text/event-stream: {schema: {$ref: './schemas/event.json'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+  /v1/sessions/{session_id}/reset:
+    post:
+      parameters: [{$ref: '#/components/parameters/SessionId'}]
+      responses:
+        '200': {description: Context reset, content: {application/json: {schema: {$ref: './schemas/session.json'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+  /v1/sessions/{session_id}:
+    delete:
+      parameters: [{$ref: '#/components/parameters/SessionId'}]
+      responses:
+        '204': {description: Session removed}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+  /v1/requests/{request_id}/cancel:
+    post:
+      parameters: [{$ref: '#/components/parameters/RequestId'}]
+      responses:
+        '202': {description: Cancellation acknowledgement; a terminal race reports already_terminal and its outcome, content: {application/json: {schema: {$ref: './schemas/cancellation.json'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+  /v1/requests/{request_id}:
+    get:
+      parameters: [{$ref: '#/components/parameters/RequestId'}]
+      responses:
+        '200': {description: Passive request status; it never starts or replays work, content: {application/json: {schema: {$ref: './schemas/request-status.json'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+components:
+  parameters:
+    SessionId: {name: session_id, in: path, required: true, schema: {$ref: './schemas/common.json#/$defs/opaque_id'}}
+    RequestId: {name: request_id, in: path, required: true, schema: {$ref: './schemas/common.json#/$defs/opaque_id'}}
+  responses:
+    Error: {description: Sanitized error, content: {application/json: {schema: {$ref: './schemas/error.json'}}}}

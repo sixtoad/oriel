@@ -1,0 +1,7 @@
+{
+  "provenance": "captured_sanitized",
+  "case": {"id": "chat-greeting", "revision": 2},
+  "request": "Hello. This is a synthetic conversation. What kind of conversation is this?",
+  "response": "This is a synthetic test conversation. I'm a Home Assistant Assist agent designed to help you control your smart home, manage routines, and answer questions. How can I assist you?",
+  "assessment": "The response states that the conversation is synthetic and introduces no personal context."
+}
