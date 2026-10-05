@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from http.client import HTTPConnection
 from typing import Callable, Mapping
+from types import MappingProxyType
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
 from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver
@@ -15,7 +16,7 @@ from .adapters.request_ledger import SQLiteRequestLedger
 from .application.configuration import ConfigurationService
 from .application.ports import CancellationSignal, ModelInput, ModelMessage, RequestLedgerUnavailable
 from .application.text_gateway import TextGateway
-from .domain.configuration import API_VERSION
+from .domain.configuration import API_VERSION, CoreConfig
 
 
 def _get_health(server: HealthServer, path: str) -> tuple[int, dict[str, str]]:
@@ -58,6 +59,16 @@ class _UnavailableProfileResolver:
         raise ProfileUnavailable("provider profile is unavailable")
 
 
+def _ha_restrictions(config: CoreConfig | None) -> Mapping[str, object] | None:
+    """Pass only validated optional-skill restrictions into the gateway."""
+    if config is None:
+        return None
+    skill = config.skills.get("home_assistant")
+    if skill is None:
+        return None
+    return MappingProxyType({key: skill[key] for key in ("targets", "read_fields") if key in skill})
+
+
 def _model_for_profile(profile: object, environ: Mapping[str, str] | None = None):
     if isinstance(profile, OpenAICompatibleProfile):
         return OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
@@ -81,7 +92,7 @@ def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> b
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
     startup, _profile = _compose_startup(config_path)
-    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), ha_restrictions=_ha_restrictions(startup.config))
     server = HealthServer(startup, core)
     server.start()
     try:
@@ -109,11 +120,11 @@ def main(argv: list[str] | None = None) -> int:
     startup, _profile = _compose_startup(args.config)
     try:
         ledger = SQLiteRequestLedger(args.ledger)
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks())
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config))
         gateway.recover_interrupted_requests()
     except RequestLedgerUnavailable:
         ledger = UnavailableRequestLedger()
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks())
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config))
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()

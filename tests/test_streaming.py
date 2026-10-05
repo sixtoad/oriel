@@ -312,6 +312,16 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(model.calls, 0)
         self.assertEqual(tools.calls, [])
 
+    def test_disabled_typed_fast_proposals_preserve_requested_state_without_tool_dispatch(self):
+        model = CountingModel(response="model reply")
+        tools = RecordingTools()
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
+        for state in ("on", "off"):
+            events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": f"Create a reviewed harmless light proposal {state}."}, self.startup))
+            self.assertEqual([(event.type, event.outcome) for event in events], [("accepted", None), ("error", None), ("terminal", "denied")])
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(tools.calls, [])
+
     def test_complex_chat_reaches_qwen_route_after_payload_free_telemetry(self):
         model = CountingModel(response="model reply")
         telemetry = RecordingTelemetry()
