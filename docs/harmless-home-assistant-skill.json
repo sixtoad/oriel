@@ -1,0 +1,110 @@
+{
+  "contract_version": "1.0",
+  "capability_id": "home_assistant.harmless_light.v1",
+  "kind": "built_in_documentation_contract",
+  "execution": {
+    "enabled": false,
+    "provider_permission": "unverified",
+    "g2": "incomplete"
+  },
+  "operations": [
+    {
+      "id": "home_assistant.light.set_power.v1",
+      "target": {
+        "alias": "synthetic:reviewed-harmless-light"
+      },
+      "arguments": {
+        "type": "object",
+        "required": [
+          "desired_state"
+        ],
+        "properties": {
+          "desired_state": {
+            "type": "string",
+            "enum": [
+              "on",
+              "off"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "read_fields": [
+        "power_state",
+        "observed_at",
+        "freshness"
+      ],
+      "initial_deadline_seconds": 5,
+      "completion": {
+        "required": "fresh_post_operation_observation",
+        "power_state_must_match": "desired_state",
+        "otherwise": "completion_unproven",
+        "observed_after_dispatch": true
+      }
+    }
+  ],
+  "synthetic_read_fixtures": [
+    {
+      "target_alias": "synthetic:reviewed-harmless-light",
+      "power_state": "off",
+      "observed_at": "2026-10-05T00:00:00Z",
+      "freshness": "fresh"
+    },
+    {
+      "target_alias": "synthetic:reviewed-harmless-light",
+      "power_state": "on",
+      "observed_at": "2026-10-04T23:59:00Z",
+      "freshness": "stale"
+    },
+    {
+      "target_alias": "synthetic:reviewed-harmless-light",
+      "power_state": null,
+      "observed_at": null,
+      "freshness": "unavailable"
+    }
+  ],
+  "negative_permission_fixture": {
+    "restricted_call_path": "unverified",
+    "enabled": false,
+    "g2": "incomplete",
+    "dispatch_expectation": 0,
+    "result": "permission_prerequisite_unmet"
+  },
+  "exclusions": [
+    "brightness",
+    "toggle",
+    "scenes",
+    "scripts",
+    "arbitrary_services",
+    "arbitrary_attributes",
+    "templates",
+    "urls",
+    "generic_executor_inputs",
+    "authentication",
+    "privileged_actions"
+  ],
+  "sanitized_audit_conclusion": {
+    "target_review": "one operator-reviewed non-critical light is represented only by the synthetic alias",
+    "effect_review": "the reviewed direct and indirect effects were concluded harmless for this bounded explicit-state operation",
+    "public_evidence": "synthetic fixtures and this sanitized conclusion only"
+  },
+  "permission_prerequisite": {
+    "status": "unverified",
+    "required_evidence": [
+      "existing_restricted_connection",
+      "effective_call_path_allows_only_contract_operation",
+      "excluded_operation_is_denied",
+      "sanitized_evidence_recorded"
+    ],
+    "prohibited_substitutes": [
+      "account_label",
+      "broad_privileged_connection"
+    ]
+  },
+  "idempotency": {
+    "owner": "oriel_action_ledger",
+    "caller_selectable": false,
+    "duplicate": "return_existing_action_status",
+    "uncertain": "outcome_unknown_no_automatic_redispatch"
+  }
+}
