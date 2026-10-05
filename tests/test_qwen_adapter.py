@@ -228,6 +228,42 @@ class QwenAdapterTests(unittest.TestCase):
         self.assertFalse(tools.dispatched)
         self.assertEqual(validate_stream([payload for _kind, payload in frames]), [])
 
+    def test_typed_or_control_bearing_ha_candidates_are_denied_without_dispatch(self) -> None:
+        for proposal in (
+            {"operation": "home_assistant.light.set_power.v1", "target": "synthetic:reviewed-harmless-light", "arguments": {"desired_state": "on"}},
+            {"provider_url": "model-selected"},
+        ):
+            with self.subTest(proposal=proposal):
+                arguments = json.dumps(proposal, separators=(",", ":"))
+                worker = self.worker_server([
+                    data({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "oriel-proposal-v1", "arguments": arguments}}]}, "finish_reason": None}]}),
+                    data({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                    b"data: [DONE]\n\n",
+                ])
+                tools = RecordingTools()
+                server = self.gateway_server(worker, tools)
+                frames = self.stream_turn(server, self.session_id(server), "propose")
+                self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
+                self.assertEqual(frames[1][1]["error"]["category"], "policy_denial")
+                self.assertEqual(frames[-1][1]["outcome"], "denied")
+                self.assertFalse(tools.dispatched)
+
+    def test_malformed_generic_tool_call_reaches_application_admission_without_dispatch(self) -> None:
+        arguments = json.dumps({"proposal_version": "1.0"}, separators=(",", ":"))
+        worker = self.worker_server([
+            data({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "type": "function", "function": {"name": "oriel-proposal-v1", "arguments": arguments}}]}, "finish_reason": None}]}),
+            data({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+            b"data: [DONE]\n\n",
+        ])
+        tools = RecordingTools()
+        server = self.gateway_server(worker, tools)
+        frames = self.stream_turn(server, self.session_id(server), "propose")
+
+        self.assertEqual([kind for kind, _ in frames], ["accepted", "error", "terminal"])
+        self.assertEqual(frames[1][1]["error"]["code"], "invalid_proposal")
+        self.assertEqual(frames[-1][1]["outcome"], "outcome_unknown")
+        self.assertFalse(tools.dispatched)
+
     def test_mixed_tool_content_fails_safely_without_dispatch(self) -> None:
         worker = self.worker_server([
             data({"choices": [{"delta": {"content": "ordinary", "tool_calls": []}, "finish_reason": None}]}),

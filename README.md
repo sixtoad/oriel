@@ -44,6 +44,18 @@ and makes no Home Assistant call:
 python3 -m unittest tests.test_harmless_home_assistant_skill -v
 ```
 
+The matching runtime manifest is built in and remains disabled. Optional
+`home_assistant` configuration may only narrow its synthetic target and read
+fields; malformed or expanding restrictions disable that optional skill. Typed
+proposals are validated before the tool boundary, retain no caller-selected
+deadline, authority, provider, dry-run, or idempotency controls, and are denied
+while the permission and completion prerequisites are incomplete. Validate the
+runtime policy without provider calls:
+
+```sh
+python3 -m unittest tests.test_ha_manifest -v
+```
+
 A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
 replays a real existing local-Qwen backend measurement. It is deliberately
 limited to the text backend and does not represent full Assist or voice evidence.

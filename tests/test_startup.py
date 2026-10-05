@@ -15,7 +15,7 @@ from oriel.application.ports import RequestStatusRecord
 from oriel.application.startup import UNREADY_CODE
 from oriel.application.text_gateway import AdmissionError
 from oriel.domain.configuration import CoreConfig, parse_core_config
-from oriel.__main__ import _compose_startup, main
+from oriel.__main__ import _compose_startup, _ha_restrictions, main
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -118,6 +118,24 @@ class StartupTests(unittest.TestCase):
             ):
                 selected = self.write(root, "invalid.json", content)
                 self.assertFalse(canonical_startup(selected, {}, default).ready)
+
+    def test_home_assistant_restrictions_are_immutable_and_invalid_expansion_disables_only_that_skill(self):
+        config = parse_core_config({
+            "api_version": "1.0", "provider": {"connection_ref": "fake"},
+            "skills": {"home_assistant": {"enabled": True, "targets": ["synthetic:reviewed-harmless-light"], "read_fields": ["power_state"]}},
+        })
+        self.assertEqual(config.skills["home_assistant"]["targets"], ("synthetic:reviewed-harmless-light",))
+        self.assertEqual(config.skills["home_assistant"]["read_fields"], ("power_state",))
+        restrictions = _ha_restrictions(config)
+        self.assertEqual(dict(restrictions), {"targets": ("synthetic:reviewed-harmless-light",), "read_fields": ("power_state",)})
+        with self.assertRaises(TypeError):
+            restrictions["targets"] = ()  # type: ignore[index]
+        invalid = parse_core_config({
+            "api_version": "1.0", "provider": {"connection_ref": "fake"},
+            "skills": {"home_assistant": {"enabled": True, "targets": ["synthetic:added-target"]}},
+        })
+        self.assertEqual(invalid.disabled_skills, ("home_assistant",))
+        self.assertEqual(dict(invalid.skills), {})
 
     def test_invalid_optional_skill_is_disabled_without_unready_core(self):
         config = parse_core_config(

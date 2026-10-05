@@ -5,11 +5,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Iterator, Mapping
+from types import MappingProxyType
 
 from .fast_router import FastRoute, route as select_fast_route
 from .ports import BackgroundTaskPort, CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
+from ..domain.ha_manifest import is_ha_shaped_candidate, validate_ha_proposal
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
@@ -121,7 +123,7 @@ class _Request:
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -137,6 +139,7 @@ class TextGateway:
         self._turn_deadline_seconds = turn_deadline_seconds
         self._scheduler = scheduler
         self._tasks = tasks
+        self._ha_restrictions = None if ha_restrictions is None else MappingProxyType({key: tuple(value) if isinstance(value, (list, tuple)) else value for key, value in ha_restrictions.items()})
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
         if not startup.ready:
@@ -424,8 +427,12 @@ class TextGateway:
                         return
                     proposal = self._admit_proposal(request, item.proposal)
                     if proposal is None:
-                        yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
-                        yield self._terminal(request, "outcome_unknown")
+                        if is_ha_shaped_candidate(item.proposal):
+                            yield self._error(request, "ha_proposal_denied", "policy_denial", "The proposed action is unavailable.", False)
+                            yield self._terminal(request, "denied")
+                        else:
+                            yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
+                            yield self._terminal(request, "outcome_unknown")
                         return
                     saw_proposal = True
                     yield proposal
@@ -581,6 +588,17 @@ class TextGateway:
 
     def _admit_proposal(self, request: _Request, proposal: Mapping[str, object]) -> StreamEvent | None:
         """Apply the one application proposal boundary shared by every route."""
+        if is_ha_shaped_candidate(proposal):
+            # The reviewed alias has no generic-proposal path.  Validation is
+            # still performed for its deterministic policy result, but the
+            # built-in action remains disabled and cannot reach ToolPort.
+            result = validate_ha_proposal(proposal, self._ha_restrictions)
+            if result.denial_code is not None:
+                try:
+                    self._telemetry.emit("ha_proposal_denied", {"code": result.denial_code})
+                except Exception:
+                    pass
+            return None
         if not validate_proposal(proposal) or not proposal_event_size_is_bounded(proposal):
             return None
         return self._proposal_event(request, proposal)

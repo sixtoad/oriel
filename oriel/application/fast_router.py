@@ -6,6 +6,8 @@ import re
 import unicodedata
 from typing import Iterable, Literal, Mapping
 
+from ..domain.ha_manifest import canonical_ha_proposal
+
 from .ports import ModelMessage
 
 
@@ -64,6 +66,8 @@ def route(text: str, context: Iterable[ModelMessage], proposal_deadline: str | N
         return FastRoute("limitation", content="Music playback is unsupported.")
     if _LIVE_HOME_STATE.search(request):
         return FastRoute("limitation", content="Live home-state lookup is unsupported.")
+    if request in {"create a reviewed harmless light proposal on", "create a reviewed harmless light proposal off"}:
+        return FastRoute("proposal", proposal=canonical_ha_proposal(request.rsplit(" ", 1)[1]))
     if request == "create a synthetic proposal":
         if proposal_deadline is None:
             raise ValueError("synthetic proposals require an application deadline")
