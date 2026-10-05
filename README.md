@@ -35,6 +35,15 @@ The probe is neither a gateway nor Ingress evidence. Run it through each
 supported direct and Ingress placement separately; until sanitized Ingress
 evidence is retained, that criterion remains incomplete.
 
+The [harmless Home Assistant capability contract](docs/harmless-home-assistant-skill.md)
+defines the one selected synthetic light capability. It remains disabled while
+the restricted provider call path is unverified; the contract test is offline
+and makes no Home Assistant call:
+
+```sh
+python3 -m unittest tests.test_harmless_home_assistant_skill -v
+```
+
 A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
 replays a real existing local-Qwen backend measurement. It is deliberately
 limited to the text backend and does not represent full Assist or voice evidence.
