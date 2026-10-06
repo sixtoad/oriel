@@ -23,6 +23,18 @@ automation detail. The synthetic read fixtures include fresh, stale, and
 unavailable evidence while keeping the selected read shape inspectable without
 provider I/O.
 
+The text gateway can render the reviewed synthetic fact only after closed
+manifest validation. Its structured fact event contains only `power_state`,
+`observed_at`, and `freshness`; fresh observations are named as fresh, stale
+observations remain stale, and unavailable reads say so without inventing a
+current state. This demo does not contact Home Assistant or expose an entity,
+connection, credential, or provider response.
+
+The read request has its own closed operation ID and accepts exactly the
+operation, synthetic target, and approved field list recorded in the JSON
+contract. It is not an action proposal and cannot carry desired state,
+dispatch controls, or provider details.
+
 Execution remains disabled. The negative permission fixture records that the
 restricted existing call path is unverified, expects zero dispatch, and leaves
 G2 incomplete. Selecting this contract grants no credential, authentication,

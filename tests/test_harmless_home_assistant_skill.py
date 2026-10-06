@@ -1,8 +1,12 @@
 """Offline checks for the frozen, disabled Home Assistant capability contract."""
 import json
+from dataclasses import replace
 from pathlib import Path
 import socket
 import unittest
+
+from oriel.adapters.ha_facts import SyntheticHaFactReader
+from oriel.domain.ha_manifest import canonical_ha_fact_request, validate_ha_fact_request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +57,41 @@ class HarmlessHomeAssistantSkillTests(unittest.TestCase):
         self.assertIsNone(fixtures[2]["power_state"])
         self.assertEqual(self.contract["operations"][0]["completion"]["otherwise"], "completion_unproven")
         self.assertTrue(self.contract["operations"][0]["completion"]["observed_after_dispatch"])
+
+    def test_closed_read_contract_and_runtime_fixtures_stay_aligned(self) -> None:
+        self.assertEqual(self.contract["read"], {
+            "id": "home_assistant.light.read_fact.v1",
+            "target_alias": "synthetic:reviewed-harmless-light",
+            "fields": ["power_state", "observed_at", "freshness"],
+            "request_fields": ["operation", "target", "fields"],
+        })
+        request = validate_ha_fact_request(canonical_ha_fact_request()).request
+        self.assertIsNotNone(request)
+        for fixture in self.contract["synthetic_read_fixtures"]:
+            name = fixture["freshness"]
+            fact = SyntheticHaFactReader(lambda: True, name).read(request)
+            self.assertEqual(dict(fact.payload()), {
+                "power_state": fixture["power_state"],
+                "observed_at": fixture["observed_at"],
+                "freshness": fixture["freshness"],
+            })
+
+    def test_reader_rejects_manually_constructed_noncanonical_requests(self) -> None:
+        request = validate_ha_fact_request(canonical_ha_fact_request()).request
+        self.assertIsNotNone(request)
+        reader = SyntheticHaFactReader(lambda: True)
+        for invalid in (
+            replace(request, operation="home_assistant.light.read_other.v1"),
+            replace(request, target="synthetic:other"),
+            replace(request, fields=("power_state",)),
+            replace(request, manifest_revision="other"),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(dict(reader.read(invalid).payload()), {
+                    "power_state": None,
+                    "observed_at": None,
+                    "freshness": "unavailable",
+                })
 
     def test_negative_unverified_permission_fixture_keeps_execution_disabled_with_zero_dispatch(self) -> None:
         negative = self.contract["negative_permission_fixture"]

@@ -12,7 +12,8 @@ from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import urlparse
 
 from ..application.configuration import ActivationResult, ActivationSucceeded, ConfigurationService
-from ..application.ports import HaWorkerAvailability, HaWorkerAvailabilityPort
+from ..application.ports import HaWorkerAvailability, HaWorkerAvailabilityPort, HomeFactReaderPort
+from .ha_facts import SyntheticHaFactReader
 from ..application.startup import MODEL_UNREADY_CODE, StartupState, UNREADY_CODE
 from ..domain.configuration import ConfigError, parse_core_config
 
@@ -116,6 +117,11 @@ def select_ha_worker_channel(environ: Mapping[str, str] | None = None) -> Path |
     if not path.is_absolute() or "\x00" in value:
         return None
     return path
+
+
+def synthetic_ha_fact_reader(optional_ha_state: str, fixture: str = "fresh") -> HomeFactReaderPort:
+    """Compose the fixture reader from only the bounded optional-HA state."""
+    return SyntheticHaFactReader(lambda: optional_ha_state == "ready", fixture)
 
 
 def provider_profile_resolver(environ: Mapping[str, str] | None = None) -> ProviderProfileResolver:

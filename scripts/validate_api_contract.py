@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import math
 import re
@@ -14,7 +15,7 @@ LIMITS = {"input_bytes": 16384, "context_messages": 32, "context_bytes": 65536,
           "open_sessions": 10, "active_turns": 2, "queue_depth": 8,
           "model_deadline_seconds": 30, "streamed_content_bytes": 65536,
           "event_data_bytes": 8192}
-EVENTS = frozenset(("accepted", "ack", "content_delta", "proposal", "validation",
+EVENTS = frozenset(("accepted", "ack", "content_delta", "proposal", "fact", "validation",
                     "action_state", "error", "terminal"))
 OUTCOMES = frozenset(("completed", "denied", "failed", "cancelled", "outcome_unknown"))
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
@@ -24,6 +25,7 @@ FIXTURES = {
     "valid": {"accepted-error-categories": "accepted_error_categories", "accepted-failure": "accepted_failure", "accepted-stream": "accepted_stream",
               "cancelled-stream": "cancelled_stream", "caps": "caps",
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
+              "home-fact-stream": "home_fact_stream",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
               "passive-status": "passive_status", "preaccept-errors": "preaccept_errors"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
@@ -183,7 +185,7 @@ def validate_stream(events, path="events"):
             acked = True
         elif "message" in event:
             errors.append(loc + ".message: only ack may carry a message")
-        if kind in ("content_delta", "proposal", "validation", "action_state"):
+        if kind in ("content_delta", "proposal", "fact", "validation", "action_state"):
             useful = True
         if kind == "content_delta":
             if type(event.get("content")) is not str:
@@ -197,6 +199,10 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".proposal: proposal event requires proposal")
             else:
                 _validate_proposal(event["proposal"], loc + ".proposal", errors)
+        if kind != "fact" and "fact" in event:
+            errors.append(loc + ".fact: only fact events may carry a fact")
+        if kind == "fact":
+            _validate_fact(event.get("fact"), loc + ".fact", errors)
         if kind == "error":
             if "error" not in event:
                 errors.append(loc + ".error: error event requires error")
@@ -213,6 +219,33 @@ def validate_stream(events, path="events"):
     if not terminal:
         errors.append(path + ": exactly one terminal event is required")
     return errors
+
+
+def _validate_fact(fact, path, errors):
+    if not _keys(fact, ("power_state", "observed_at", "freshness"), path, errors):
+        return
+    freshness = fact["freshness"]
+    if freshness not in ("fresh", "stale", "unavailable"):
+        errors.append(path + ".freshness: invalid freshness")
+        return
+    if freshness == "unavailable":
+        if fact["power_state"] is not None or fact["observed_at"] is not None:
+            errors.append(path + ": unavailable fact must carry no observation")
+        return
+    if fact["power_state"] not in ("on", "off"):
+        errors.append(path + ".power_state: expected observed power state")
+    if not _utc_observation(fact["observed_at"]):
+        errors.append(path + ".observed_at: expected UTC observation time")
+
+
+def _utc_observation(value):
+    if not (type(value) is str and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value)):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_config(config, path, errors, disabled_skills=None):

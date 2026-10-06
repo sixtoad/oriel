@@ -4,7 +4,7 @@ import unittest
 
 from oriel.application.fast_router import CLARIFICATION_TEXT, RULE_REVISION, normalize_turn, route
 from oriel.application.ports import ModelMessage
-from oriel.domain.ha_manifest import validate_ha_proposal
+from oriel.domain.ha_manifest import canonical_ha_fact_request, validate_ha_proposal
 from oriel.domain.proposals import validate_proposal
 
 
@@ -55,6 +55,12 @@ class FastRouterTests(unittest.TestCase):
             self.assertTrue(result.permitted)
             self.assertEqual(result.material.argument_object(), {"desired_state": state})
             self.assertFalse(result.policy.enabled)
+
+    def test_only_the_reviewed_status_question_selects_the_closed_fact_request(self) -> None:
+        decision = route("What is the reviewed harmless light status?", ())
+        self.assertEqual(decision.route, "fact")
+        self.assertEqual(decision.fact_request, canonical_ha_fact_request())
+        self.assertEqual(route("What is the kitchen light status?", ()).content, "Live home-state lookup is unsupported.")
 
     def test_complex_chat_is_explicitly_deferred_to_qwen(self) -> None:
         self.assertEqual(route("Explain why the sky looks blue.", ()).route, "qwen")
