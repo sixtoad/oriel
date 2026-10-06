@@ -212,3 +212,35 @@ class ToolPort(Protocol):
     """A future tool seam. Bootstrap adapters must deny every dispatch."""
 
     def dispatch(self, name: str, arguments: Mapping[str, str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class DryRunPreview:
+    """The bounded result of an independently validated synthetic preview."""
+
+    status: str
+    operation: str | None
+    target: str | None
+    desired_state: str | None
+    manifest_revision: str | None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"simulated", "denied", "unavailable"}:
+            raise ValueError("invalid dry-run status")
+        complete = (self.operation, self.target, self.desired_state, self.manifest_revision)
+        if self.status == "simulated":
+            if not all(isinstance(value, str) and value for value in complete) or self.desired_state not in {"on", "off"} or self.reason is not None:
+                raise ValueError("invalid simulated dry-run")
+        elif any(value is not None for value in complete):
+            raise ValueError("invalid failed dry-run")
+        elif self.status == "denied" and self.reason != "adapter_rejected":
+            raise ValueError("invalid denied dry-run")
+        elif self.status == "unavailable" and self.reason != "adapter_unavailable":
+            raise ValueError("invalid unavailable dry-run")
+
+
+class DryRunPreviewPort(Protocol):
+    """Independently validates and simulates one already-canonical proposal."""
+
+    def preview(self, proposal: object) -> DryRunPreview: ...

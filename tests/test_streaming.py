@@ -14,12 +14,14 @@ from unittest.mock import patch
 
 from oriel.adapters.bootstrap import AdvanceableClock, DeterministicScheduler, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RecordingTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
+from oriel.adapters.ha_dry_run import HarmlessHaDryRun
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
 from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, RequestLedgerUnavailable
 from oriel.application.fast_router import FastRoute
 from oriel.application.text_gateway import AdmissionError, TextGateway
+from oriel.domain.ha_manifest import BuiltInManifest, canonical_ha_proposal
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -74,8 +76,8 @@ class StreamingHttpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._directory.cleanup()
 
-    def with_server(self, model: FakeModel, ledger: object | None = None, scheduler=None, tasks=None) -> HealthServer:
-        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks)
+    def with_server(self, model: FakeModel, ledger: object | None = None, scheduler=None, tasks=None, ha_manifest=None, ha_preview=None) -> HealthServer:
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks, ha_manifest=ha_manifest or BuiltInManifest(), ha_preview=ha_preview)
         server = HealthServer(self.startup, gateway)
         server.start()
         self.addCleanup(server.close)
@@ -129,6 +131,26 @@ class StreamingHttpTests(unittest.TestCase):
         connection = self.connection(server)
         connection.request("POST", f"/v1/requests/{request_id}/cancel")
         return connection, connection.getresponse()
+
+    def test_http_preview_stream_serializes_canonical_validation_payload(self):
+        class PreviewModel(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                yield ModelProposal(canonical_ha_proposal("on"))
+                yield ModelOutcome("completed")
+
+        manifest = BuiltInManifest(enabled=True)
+        server = self.with_server(PreviewModel(), ha_manifest=manifest, ha_preview=HarmlessHaDryRun(manifest))
+        session = self.create_session(server)
+        connection, response = self.turn_response(server, str(session["session_id"]), b'{"input":"Explain this."}')
+        try:
+            self.assertEqual(response.status, 200)
+            frames = [self.read_frame(response) for _ in range(4)]
+            self.assertEqual([kind for kind, _payload in frames], ["accepted", "proposal", "validation", "terminal"])
+            self.assertEqual(frames[1][1]["proposal"], {"operation": "home_assistant.light.set_power.v1", "target": "synthetic:reviewed-harmless-light", "arguments": {"desired_state": "on"}, "manifest_revision": "home_assistant.harmless_light.v1"})
+            self.assertEqual(frames[2][1]["preview"], {"status": "simulated", "operation": "home_assistant.light.set_power.v1", "target": "synthetic:reviewed-harmless-light", "arguments": {"desired_state": "on"}, "manifest_revision": "home_assistant.harmless_light.v1"})
+        finally:
+            connection.close()
 
     def test_delayed_stream_is_ordered_and_status_is_passive(self):
         model = CountingModel(chunks=("hello", " world"), delay_seconds=0.15)

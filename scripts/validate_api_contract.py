@@ -25,10 +25,10 @@ FIXTURES = {
               "cancelled-stream": "cancelled_stream", "caps": "caps",
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
-              "passive-status": "passive_status", "preaccept-errors": "preaccept_errors"},
+              "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
                 "cancellation-outcome": "cancellation_outcome", "out-of-order-sequence": "invalid_sequence", "passive-status-outcome": "passive_status_outcome", "post-terminal": "post_terminal",
-                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field"},
+                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview"},
 }
 FIXTURE_NAMES = frozenset(name for group in FIXTURES.values() for name in group.values())
 
@@ -144,6 +144,7 @@ def validate_stream(events, path="events"):
     seq = 0
     acked = useful = terminal = False
     streamed_content_bytes = 0
+    preview_proposal = None
     for index, event in enumerate(events):
         loc = f"{path}[{index}]"
         if not _keys(event, ("api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"), loc, errors, allow_extra=True):
@@ -197,6 +198,20 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".proposal: proposal event requires proposal")
             else:
                 _validate_proposal(event["proposal"], loc + ".proposal", errors)
+                preview_proposal = event["proposal"] if _is_ha_material(event["proposal"]) else None
+        if kind == "validation":
+            if "preview" not in event:
+                errors.append(loc + ".preview: validation requires preview")
+            else:
+                _validate_preview(event["preview"], loc + ".preview", errors)
+                preview = event["preview"]
+                if type(preview) is dict and preview.get("status") == "simulated":
+                    material = {key: preview.get(key) for key in ("operation", "target", "arguments", "manifest_revision")}
+                    if preview_proposal is None or material != preview_proposal:
+                        errors.append(loc + ".preview: simulated preview must follow its identical harmless-light proposal")
+                preview_proposal = None
+        elif "preview" in event:
+            errors.append(loc + ".preview: only validation may carry preview")
         if kind == "error":
             if "error" not in event:
                 errors.append(loc + ".error: error event requires error")
@@ -251,6 +266,9 @@ def _validate_manifest(manifest, path, errors):
 
 
 def _validate_proposal(proposal, path, errors):
+    if type(proposal) is dict and set(proposal) == {"operation", "target", "arguments", "manifest_revision"}:
+        _validate_ha_material(proposal, path, errors)
+        return
     required = ("proposal_version", "proposal_id", "action", "target", "arguments", "dry_run", "idempotency", "deadline", "confirmation")
     if not _keys(proposal, required, path, errors, optional=("state", "result")): return
     if proposal["proposal_version"] != "1.0": errors.append(path + ".proposal_version: expected 1.0")
@@ -275,6 +293,43 @@ def _validate_proposal(proposal, path, errors):
                 errors.append(path + ".result.state: invalid result state")
             if "detail" in result and not (type(result["detail"]) is str and len(result["detail"]) <= 256):
                 errors.append(path + ".result.detail: expected bounded detail")
+
+
+def _validate_ha_material(value, path, errors):
+    if not _keys(value, ("operation", "target", "arguments", "manifest_revision"), path, errors):
+        return
+    if value["operation"] != "home_assistant.light.set_power.v1":
+        errors.append(path + ".operation: unsupported operation")
+    if value["target"] != "synthetic:reviewed-harmless-light":
+        errors.append(path + ".target: unsupported target")
+    if value["manifest_revision"] != "home_assistant.harmless_light.v1":
+        errors.append(path + ".manifest_revision: unsupported revision")
+    if _keys(value["arguments"], ("desired_state",), path + ".arguments", errors) and value["arguments"]["desired_state"] not in ("on", "off"):
+        errors.append(path + ".arguments.desired_state: invalid desired state")
+
+
+def _is_ha_material(value):
+    return type(value) is dict and set(value) == {"operation", "target", "arguments", "manifest_revision"}
+
+
+def _validate_preview(value, path, errors):
+    if not _keys(value, ("status",), path, errors, optional=("operation", "target", "arguments", "manifest_revision", "reason")):
+        return
+    status = value["status"]
+    if status not in ("simulated", "denied", "unavailable"):
+        errors.append(path + ".status: invalid preview status")
+        return
+    material = {key: value[key] for key in ("operation", "target", "arguments", "manifest_revision") if key in value}
+    if status == "simulated":
+        if "reason" in value:
+            errors.append(path + ".reason: simulated preview has no reason")
+        _validate_ha_material(material, path, errors)
+    else:
+        if material:
+            errors.append(path + ": unavailable or denied preview has no canonical material")
+        expected_reason = "adapter_rejected" if status == "denied" else "adapter_unavailable"
+        if value.get("reason") != expected_reason:
+            errors.append(path + ".reason: invalid preview reason")
 
 
 def validate_turn(turn, path="turn"):

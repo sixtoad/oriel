@@ -7,6 +7,11 @@
     "provider_permission": "unverified",
     "g2": "incomplete"
   },
+  "dry_run": {
+    "result": "simulated",
+    "requires_test_injected_enabled_manifest": true,
+    "dispatch_expectation": 0
+  },
   "operations": [
     {
       "id": "home_assistant.light.set_power.v1",

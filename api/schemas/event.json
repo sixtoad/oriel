@@ -15,13 +15,15 @@
     "seq": {"type": "integer", "minimum": 1},
     "message": {"const": "Work is continuing."},
     "content": {"type": "string", "maxLength": 65536},
-    "proposal": {"$ref": "proposal.json"},
+    "proposal": {"oneOf": [{"$ref": "proposal.json"}, {"$ref": "ha-proposal.json"}]},
+    "preview": {"$ref": "ha-preview.json"},
     "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]},
     "error": {"$ref": "error.json#/properties/error"}
   },
   "allOf": [
     {"if": {"properties": {"type": {"const": "content_delta"}}}, "then": {"required": ["content"]}},
     {"if": {"properties": {"type": {"const": "proposal"}}}, "then": {"required": ["proposal"]}},
+    {"if": {"properties": {"type": {"const": "validation"}}}, "then": {"required": ["preview"]}, "else": {"not": {"required": ["preview"]}}},
     {"if": {"properties": {"type": {"const": "error"}}}, "then": {"required": ["error"]}},
     {"if": {"properties": {"type": {"const": "terminal"}}}, "then": {"required": ["outcome"]}},
     {"if": {"properties": {"type": {"const": "ack"}}}, "then": {"required": ["message"], "properties": {"api_version": {}, "type": {}, "request_id": {}, "session_id": {}, "trace_id": {}, "context_generation": {}, "seq": {}, "message": {"const": "Work is continuing."}}, "additionalProperties": false, "not": {"anyOf": [{"required": ["content"]}, {"required": ["proposal"]}, {"required": ["error"]}, {"required": ["outcome"]}]}}, "else": {"not": {"required": ["message"]}}}
