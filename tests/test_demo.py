@@ -51,6 +51,19 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn("requests", source)
         self.assertNotIn("homeassistant", source.lower())
 
+    def test_demo_output_does_not_disclose_an_unrelated_worker_input(self):
+        canary = "CANARY_MUST_NOT_APPEAR_IN_DEMO"
+        result = subprocess.run(
+            [sys.executable, str(DEMO), "--self-test"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={"ORIEL_HA_WORKER_CONNECTION_REF": canary},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(canary, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

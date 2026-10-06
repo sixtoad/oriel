@@ -56,6 +56,20 @@ runtime policy without provider calls:
 python3 -m unittest tests.test_ha_manifest -v
 ```
 
+When the optional HA worker is introduced, it is started separately and owns
+its opaque provider connection input. The gateway receives only the local
+worker channel location and observes a fixed availability result; it never
+receives the worker input. Replace that input in the worker's own environment
+or secret mount, stop the worker, and start a replacement worker on the same
+channel. Restart the gateway to re-probe it. The worker exposes no Home
+Assistant reads or actions at this stage.
+
+The worker is an adapter-private process: start it with a protected absolute
+channel selected by the deployment, and give its service environment the
+worker-only input. The channel directory must not be writable by other users;
+the worker creates an owner-only socket and removes it on a normal stop. No
+gateway command starts or restarts the worker.
+
 A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
 replays a real existing local-Qwen backend measurement. It is deliberately
 limited to the text backend and does not represent full Assist or voice evidence.
