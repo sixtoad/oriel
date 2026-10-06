@@ -5,6 +5,23 @@ from dataclasses import dataclass
 from typing import Callable, ContextManager, Iterable, Mapping, Protocol
 
 
+@dataclass(frozen=True)
+class HaWorkerAvailability:
+    """The only HA-worker fact allowed to enter application readiness."""
+
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"ready", "unavailable"}:
+            raise ValueError("invalid HA worker availability")
+
+
+class HaWorkerAvailabilityPort(Protocol):
+    """Reports bounded HA-worker availability without provider material."""
+
+    def availability(self) -> HaWorkerAvailability: ...
+
+
 class ModelPort(Protocol):
     """Produces text for an already-admitted, bounded input."""
 

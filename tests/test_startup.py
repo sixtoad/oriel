@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from oriel.adapters.bootstrap import ThreadSafeSynchronization
-from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path
+from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path, select_ha_worker_channel
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ActivationConflict, ActivationRejected, ActivationSucceeded, ConfigurationService, READY_PROFILE_LABEL
 from oriel.application.ports import RequestStatusRecord
@@ -314,6 +314,14 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(model_down.components, {"core": {"state": "ready"}, "model": {"state": "unready", "code": "model_unavailable"}, "ha": {"state": "degraded"}})
         self.assertTrue(model_up.ready)
         self.assertEqual(model_up.components["ha"], {"state": "ready"})
+
+    def test_ha_worker_channel_selection_reads_only_its_non_secret_private_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = Path(directory) / "worker.sock"
+            selected = select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": str(channel), "ORIEL_HA_WORKER_CONNECTION_REF": "CANARY"})
+        self.assertEqual(selected, channel)
+        self.assertIsNone(select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": "relative.sock"}))
+        self.assertIsNone(select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": "\x00invalid"}))
 
     def test_blocked_probe_makes_startup_unready_without_delaying_liveness(self):
         with tempfile.TemporaryDirectory() as directory:

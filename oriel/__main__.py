@@ -9,7 +9,8 @@ from typing import Callable, Mapping
 from types import MappingProxyType
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
-from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver
+from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver, select_ha_worker_channel
+from .adapters.ha_worker import UnixHaWorkerClient
 from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
 from .adapters.request_ledger import SQLiteRequestLedger
@@ -38,6 +39,7 @@ def _compose_startup(
 ):
     """Select the one local profile resolver and activate configuration once."""
     configuration = ConfigurationService(ThreadSafeSynchronization())
+    channel = select_ha_worker_channel(environ)
     try:
         resolver = provider_profile_resolver(environ)
     except ProfileUnavailable:
@@ -50,6 +52,7 @@ def _compose_startup(
         environ=environ,
         model_probe=model_probe or (lambda profile: _model_ready(profile, environ)),
         optional_ha_probe=optional_ha_probe,
+        optional_ha_worker=None if channel is None else UnixHaWorkerClient(channel),
     )
 
 
