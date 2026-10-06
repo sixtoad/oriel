@@ -149,6 +149,21 @@ class TextClientTests(unittest.TestCase):
         self.assertIn("terminal: outcome=denied", output)
         self.assertNotIn("completed action", output)
 
+    def test_validation_preview_renders_its_simulated_or_limited_meaning(self):
+        stream = b"".join(
+            [
+                frame("accepted", event("accepted")),
+                frame("validation", event("validation", seq=2, preview={"status": "simulated", "operation": "home_assistant.light.set_power.v1", "target": "synthetic:reviewed-harmless-light", "manifest_revision": "home_assistant.harmless_light.v1"})),
+                frame("validation", event("validation", seq=3, preview={"status": "unavailable", "reason": "adapter_unavailable"})),
+                frame("terminal", event("terminal", seq=4, outcome="completed")),
+            ]
+        )
+        with ScriptedServer([(200, stream, "text/event-stream")]) as server:
+            result, output, _errors = self.run_client(server, "continue", "ses-1", "preview")
+        self.assertEqual(result, 0)
+        self.assertIn("preview: simulated operation=home_assistant.light.set_power.v1", output)
+        self.assertIn("preview: unavailable reason=adapter_unavailable", output)
+
     def test_typed_terminal_outcomes_are_displayed_from_their_structured_field(self):
         outcomes = ("failed", "cancelled", "outcome_unknown")
         responses = []

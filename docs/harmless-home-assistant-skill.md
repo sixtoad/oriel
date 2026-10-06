@@ -47,6 +47,11 @@ cannot satisfy it. Idempotency belongs to the Oriel action ledger, is never
 caller-selectable, returns the existing action status for a duplicate, and never
 automatically redispatches an uncertain action.
 
+Dry-run is an explicit simulation only. A successful preview requires a
+reviewed enabled manifest injected by a focused test; the shipped manifest
+stays disabled. It validates the canonical synthetic alias and closed `on` or
+`off` argument independently, returns `simulated`, and records zero action I/O.
+
 Brightness, toggle, scenes, scripts, arbitrary services or attributes,
 templates, URLs, generic executor inputs, authentication, and privileged
 actions are excluded from this contract.
