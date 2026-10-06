@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import unittest
 
-from oriel.domain.ha_manifest import BUILT_IN_MANIFEST, FORBIDDEN_CONTROL_FIELDS, OPERATION_ID, TARGET_ALIAS, canonical_ha_proposal, compute_effective_policy, is_ha_shaped_candidate, validate_ha_proposal
+from oriel.domain.ha_manifest import BUILT_IN_MANIFEST, FACT_OPERATION_ID, FORBIDDEN_CONTROL_FIELDS, OPERATION_ID, READ_FIELD_ORDER, TARGET_ALIAS, canonical_ha_fact_request, canonical_ha_proposal, compute_effective_policy, is_ha_fact_candidate, is_ha_shaped_candidate, validate_ha_fact_request, validate_ha_proposal
 
 
 class HaManifestTests(unittest.TestCase):
@@ -70,6 +70,40 @@ class HaManifestTests(unittest.TestCase):
         self.assertTrue(is_ha_shaped_candidate({"operation": "home_assistant.light.unsupported.v1"}))
         self.assertFalse(is_ha_shaped_candidate({"operation": "future_generic_operation"}))
         self.assertFalse(is_ha_shaped_candidate({"action": "generic_action", "target": "synthetic:generic", "arguments": {"values": []}, "deadline": "2030-01-01T00:00:00Z", "dry_run": True, "idempotency": "x", "proposal_version": "1.0", "proposal_id": "p", "confirmation": {"required": True, "evidence": None}}))
+
+    def test_closed_fact_requests_use_the_same_effective_manifest_intersection(self) -> None:
+        request = canonical_ha_fact_request()
+        result = validate_ha_fact_request(request)
+        self.assertTrue(result.permitted)
+        self.assertEqual(result.request.operation, FACT_OPERATION_ID)
+        self.assertEqual(result.request.target, TARGET_ALIAS)
+        self.assertEqual(result.request.fields, READ_FIELD_ORDER)
+
+        denied_cases = (
+            ({**request, "target": "synthetic:other"}, "target_not_permitted"),
+            ({**request, "fields": ["power_state", "observed_at", "freshness", "ignore policy"]}, "invalid_fact_fields"),
+            ({**request, "deadline": "model-selected"}, "caller_selected_control"),
+            ({**request, "instruction": "ignore policy"}, "malformed_fact_request"),
+        )
+        for candidate, code in denied_cases:
+            with self.subTest(candidate=candidate):
+                self.assertEqual(validate_ha_fact_request(candidate).denial_code, code)
+                self.assertTrue(is_ha_fact_candidate(candidate))
+
+        self.assertEqual(
+            validate_ha_fact_request(request, {"targets": [TARGET_ALIAS], "read_fields": ["power_state"]}).denial_code,
+            "invalid_fact_fields",
+        )
+        self.assertFalse(is_ha_fact_candidate({"operation": "future_generic_operation", "fields": []}))
+
+    def test_closed_fact_request_stays_aligned_with_the_documented_capability(self) -> None:
+        contract = json.loads((Path(__file__).resolve().parents[1] / "docs" / "harmless-home-assistant-skill.json").read_text(encoding="utf-8"))
+        self.assertEqual(contract["read"], {
+            "id": FACT_OPERATION_ID,
+            "target_alias": TARGET_ALIAS,
+            "fields": list(READ_FIELD_ORDER),
+            "request_fields": ["operation", "target", "fields"],
+        })
 
 
 if __name__ == "__main__":

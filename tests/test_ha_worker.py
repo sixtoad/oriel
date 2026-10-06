@@ -13,7 +13,9 @@ import unittest
 
 from oriel.adapters.ha_worker import MAX_FRAME_BYTES, UnixHaWorkerClient, availability_request, unavailable_response
 from oriel.adapters.ha_worker_process import CONNECTION_INPUT_ENV, serve_once
+from oriel.adapters.configuration import synthetic_ha_fact_reader
 from oriel.__main__ import _compose_startup
+from oriel.domain.ha_manifest import validate_ha_fact_request, canonical_ha_fact_request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -229,6 +231,14 @@ class HaWorkerTests(unittest.TestCase):
             self.assertEqual(response, unavailable_response())
             self.assertNotIn(b"CANARY", response)
             self.assertNotEqual(response, availability_request())
+
+    def test_worker_unavailable_fact_reader_returns_only_the_bounded_limitation(self) -> None:
+        request = validate_ha_fact_request(canonical_ha_fact_request()).request
+        self.assertIsNotNone(request)
+        fact = synthetic_ha_fact_reader("degraded").read(request)
+
+        self.assertEqual(dict(fact.payload()), {"power_state": None, "observed_at": None, "freshness": "unavailable"})
+        self.assertNotIn("CANARY", repr(fact))
 
 
 if __name__ == "__main__":

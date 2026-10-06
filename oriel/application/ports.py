@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Iterable, Mapping, Protocol
+import re
+from datetime import datetime
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, ContextManager, Iterable, Mapping, Protocol
+
+if TYPE_CHECKING:
+    from ..domain.ha_manifest import FactRequest
+
+
+_UTC_TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,49 @@ class HaWorkerAvailabilityPort(Protocol):
     """Reports bounded HA-worker availability without provider material."""
 
     def availability(self) -> HaWorkerAvailability: ...
+
+
+@dataclass(frozen=True)
+class BoundedHomeFact:
+    """The complete provider-neutral observation allowed out of the HA adapter."""
+
+    power_state: str | None
+    observed_at: str | None
+    freshness: str
+
+    def __post_init__(self) -> None:
+        if self.freshness not in {"fresh", "stale", "unavailable"}:
+            raise ValueError("invalid fact freshness")
+        if self.freshness == "unavailable":
+            if self.power_state is not None or self.observed_at is not None:
+                raise ValueError("unavailable facts carry no observation")
+        elif self.power_state not in {"on", "off"} or not isinstance(self.observed_at, str) or _UTC_TIMESTAMP.fullmatch(self.observed_at) is None or not _valid_utc_timestamp(self.observed_at):
+            raise ValueError("observed facts require bounded state and time")
+
+    def payload(self) -> Mapping[str, str | None]:
+        return MappingProxyType({
+            "power_state": self.power_state,
+            "observed_at": self.observed_at,
+            "freshness": self.freshness,
+        })
+
+    @classmethod
+    def unavailable(cls) -> "BoundedHomeFact":
+        return cls(None, None, "unavailable")
+
+
+def _valid_utc_timestamp(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+class HomeFactReaderPort(Protocol):
+    """Reads one already-admitted fact without exposing provider material."""
+
+    def read(self, request: "FactRequest") -> BoundedHomeFact: ...
 
 
 class ModelPort(Protocol):

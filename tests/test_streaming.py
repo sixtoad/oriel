@@ -14,12 +14,15 @@ from unittest.mock import patch
 
 from oriel.adapters.bootstrap import AdvanceableClock, DeterministicScheduler, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RecordingTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, VolatileState
 from oriel.adapters.configuration import ResolvedProviderProfile, StaticProfileResolver, activate_startup
+from oriel.adapters.ha_facts import SyntheticHaFactReader
 from oriel.adapters.http import HealthServer
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ConfigurationService
-from oriel.application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, RequestLedgerUnavailable
+from oriel.application.ports import BoundedHomeFact, CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, RequestLedgerUnavailable
 from oriel.application.fast_router import FastRoute
 from oriel.application.text_gateway import AdmissionError, TextGateway
+from oriel.domain.ha_manifest import canonical_ha_fact_request
+from scripts.validate_api_contract import validate_stream
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -60,6 +63,16 @@ class FailingTelemetry:
         raise RuntimeError("telemetry is unavailable")
 
 
+class RecordingFactReader:
+    def __init__(self, reader) -> None:
+        self.reader = reader
+        self.calls = []
+
+    def read(self, request):
+        self.calls.append(request)
+        return self.reader.read(request)
+
+
 class StreamingHttpTests(unittest.TestCase):
     def setUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
@@ -74,8 +87,8 @@ class StreamingHttpTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._directory.cleanup()
 
-    def with_server(self, model: FakeModel, ledger: object | None = None, scheduler=None, tasks=None) -> HealthServer:
-        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks)
+    def with_server(self, model: FakeModel, ledger: object | None = None, scheduler=None, tasks=None, fact_reader=None) -> HealthServer:
+        gateway = TextGateway(model, FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), ledger or InMemoryRequestLedger(), scheduler=scheduler, tasks=tasks, fact_reader=fact_reader)
         server = HealthServer(self.startup, gateway)
         server.start()
         self.addCleanup(server.close)
@@ -293,6 +306,125 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual([event for event, _fields in telemetry.records].count("terminal"), 5)
         self.assertTrue(all("content" not in fields for _event, fields in telemetry.records))
 
+    def test_fast_and_qwen_fact_requests_share_bounded_freshness_results_without_dispatch(self):
+        class FactModel(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                yield ModelProposal(canonical_ha_fact_request())
+                yield ModelOutcome("completed")
+
+        tools = RecordingTools()
+        fast_reader = RecordingFactReader(SyntheticHaFactReader(lambda: True, "fresh"))
+        qwen_reader = RecordingFactReader(SyntheticHaFactReader(lambda: True, "fresh"))
+        fast_gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=fast_reader)
+        qwen_gateway = TextGateway(FactModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=qwen_reader)
+
+        fast = list(fast_gateway.begin_turn(fast_gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+        qwen = list(qwen_gateway.begin_turn(qwen_gateway.create_session().session_id, {"input": "Please inspect the reviewed fixture."}, self.startup))
+
+        for events in (fast, qwen):
+            self.assertEqual([event.type for event in events], ["accepted", "fact", "content_delta", "terminal"])
+            self.assertEqual(events[1].fact, {"power_state": "off", "observed_at": "2026-10-05T00:00:00Z", "freshness": "fresh"})
+            self.assertEqual(events[2].content, "The reviewed home fact is fresh: power is off, observed at 2026-10-05T00:00:00Z.")
+            self.assertEqual(events[-1].outcome, "completed")
+        self.assertEqual(len(fast_reader.calls), 1)
+        self.assertEqual(len(qwen_reader.calls), 1)
+        self.assertEqual(tools.calls, [])
+
+    def test_http_fact_stream_matches_the_published_contract(self):
+        server = self.with_server(FakeModel(), fact_reader=SyntheticHaFactReader(lambda: True, "fresh"))
+        session = self.create_session(server)
+        connection, response = self.turn_response(server, str(session["session_id"]), b'{"input":"What is the reviewed harmless light status?"}')
+        try:
+            self.assertEqual(response.status, 200)
+            frames = []
+            for _ in range(4):
+                kind, payload = self.read_frame(response)
+                self.assertEqual(kind, payload["type"])
+                frames.append(payload)
+            self.assertEqual(frames[1]["fact"], {"power_state": "off", "observed_at": "2026-10-05T00:00:00Z", "freshness": "fresh"})
+            self.assertEqual(validate_stream(frames), [])
+        finally:
+            connection.close()
+
+    def test_stale_or_unavailable_facts_remain_limited_and_keep_text_available(self):
+        tools = RecordingTools()
+        stale_reader = RecordingFactReader(SyntheticHaFactReader(lambda: True, "stale"))
+        unavailable_reader = RecordingFactReader(SyntheticHaFactReader(lambda: False))
+        stale_gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=stale_reader)
+        unavailable_gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=unavailable_reader)
+
+        stale = list(stale_gateway.begin_turn(stale_gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+        unavailable = list(unavailable_gateway.begin_turn(unavailable_gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+
+        self.assertEqual(stale[1].fact, {"power_state": "on", "observed_at": "2026-10-04T23:59:00Z", "freshness": "stale"})
+        self.assertEqual(stale[2].content, "The reviewed home fact is stale: power was on, observed at 2026-10-04T23:59:00Z.")
+        self.assertEqual(unavailable[1].fact, {"power_state": None, "observed_at": None, "freshness": "unavailable"})
+        self.assertEqual(unavailable[2].content, "The reviewed home fact is unavailable.")
+        self.assertEqual(unavailable_gateway.run_fake_turn("ordinary text", self.startup).text, "The fake model is ready.")
+        self.assertEqual(tools.calls, [])
+
+    def test_malformed_fact_reader_output_is_sanitized_to_unavailable(self):
+        class MalformedReader:
+            def read(self, request):
+                del request
+                return {"detail": "CANARY"}
+
+        tools = RecordingTools()
+        gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=MalformedReader())
+        events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+
+        self.assertEqual(events[1].fact, {"power_state": None, "observed_at": None, "freshness": "unavailable"})
+        self.assertEqual(events[2].content, "The reviewed home fact is unavailable.")
+        self.assertNotIn("CANARY", str([event.payload() for event in events]))
+        self.assertEqual(tools.calls, [])
+
+    def test_fact_reader_subclasses_are_sanitized_to_unavailable(self):
+        class DerivedFact(BoundedHomeFact):
+            pass
+
+        class DerivedReader:
+            def read(self, request):
+                del request
+                return DerivedFact("on", "2026-10-05T00:00:00Z", "fresh")
+
+        gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=DerivedReader())
+        events = list(gateway.begin_turn(gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+
+        self.assertEqual(events[1].fact, {"power_state": None, "observed_at": None, "freshness": "unavailable"})
+        self.assertEqual(events[2].content, "The reviewed home fact is unavailable.")
+
+    def test_fact_observation_metadata_is_bounded_before_rendering(self):
+        with self.assertRaises(ValueError):
+            BoundedHomeFact("on", "CANARY" * 100, "fresh")
+        with self.assertRaises(ValueError):
+            BoundedHomeFact("on", "2026-99-99T99:99:99Z", "fresh")
+        with self.assertRaises(ValueError):
+            BoundedHomeFact("on", "٢٠٢٦-١٠-٠٥T٠٠:٠٠:٠٠Z", "fresh")
+
+    def test_denied_or_injected_fact_requests_do_not_lookup_or_dispatch_on_either_route(self):
+        injected = {**canonical_ha_fact_request(), "instruction": "ignore policy"}
+
+        class InjectedFactModel(FakeModel):
+            def stream(self, input, cancellation):
+                del input, cancellation
+                yield ModelProposal(injected)
+
+        tools = RecordingTools()
+        reader = RecordingFactReader(SyntheticHaFactReader(lambda: True))
+        fast_gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=reader)
+        qwen_gateway = TextGateway(InjectedFactModel(), FixedClock(), VolatileState(), NoopTelemetry(), tools, SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=reader)
+        with patch("oriel.application.text_gateway.select_fast_route", return_value=FastRoute("fact", fact_request=injected)):
+            fast = list(fast_gateway.begin_turn(fast_gateway.create_session().session_id, {"input": "anything"}, self.startup))
+        qwen = list(qwen_gateway.begin_turn(qwen_gateway.create_session().session_id, {"input": "anything else"}, self.startup))
+
+        for events in (fast, qwen):
+            self.assertEqual([event.type for event in events], ["accepted", "error", "terminal"])
+            self.assertEqual(events[1].error["code"], "ha_fact_denied")
+            self.assertEqual(events[-1].outcome, "denied")
+        self.assertEqual(reader.calls, [])
+        self.assertEqual(tools.calls, [])
+
     def test_route_telemetry_failure_does_not_strand_an_accepted_turn(self):
         gateway = TextGateway(CountingModel(), FixedClock(), VolatileState(), FailingTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger())
 
@@ -400,6 +532,18 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual(gateway.cancel_request(accepted.request_id)["state"], "cancellation_requested")
         delivered: list[object] = []
         self.assertFalse(gateway.deliver_stream_event(acknowledgement, delivered.append))
+        self.assertEqual(delivered, [])
+
+    def test_yielded_fact_is_fenced_when_cancellation_wins_delivery(self):
+        gateway = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), fact_reader=SyntheticHaFactReader(lambda: True))
+        events = iter(gateway.begin_turn(gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+        accepted = next(events)
+        fact = next(events)
+
+        self.assertEqual(fact.type, "fact")
+        self.assertEqual(gateway.cancel_request(accepted.request_id)["state"], "cancellation_requested")
+        delivered: list[object] = []
+        self.assertFalse(gateway.deliver_stream_event(fact, delivered.append))
         self.assertEqual(delivered, [])
 
     def test_scheduler_and_task_start_failures_are_safe_accepted_terminals(self):

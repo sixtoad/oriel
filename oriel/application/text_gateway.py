@@ -8,10 +8,10 @@ from typing import Callable, Iterable, Iterator, Mapping
 from types import MappingProxyType
 
 from .fast_router import FastRoute, route as select_fast_route
-from .ports import BackgroundTaskPort, CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import BackgroundTaskPort, BoundedHomeFact, CancellationSignal, Clock, HomeFactReaderPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
-from ..domain.ha_manifest import is_ha_shaped_candidate, validate_ha_proposal
+from ..domain.ha_manifest import is_ha_fact_candidate, is_ha_shaped_candidate, validate_ha_fact_request, validate_ha_proposal
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
@@ -62,6 +62,7 @@ class StreamEvent:
     message: str | None = None
     content: str | None = None
     proposal: Mapping[str, object] | None = None
+    fact: Mapping[str, str | None] | None = None
     error: Mapping[str, object] | None = None
     outcome: str | None = None
 
@@ -73,6 +74,8 @@ class StreamEvent:
             payload["content"] = self.content
         if self.proposal is not None:
             payload["proposal"] = dict(self.proposal)
+        if self.fact is not None:
+            payload["fact"] = dict(self.fact)
         if self.error is not None:
             payload["error"] = dict(self.error)
         if self.outcome is not None:
@@ -123,7 +126,7 @@ class _Request:
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, fact_reader: HomeFactReaderPort | None = None) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -140,6 +143,7 @@ class TextGateway:
         self._scheduler = scheduler
         self._tasks = tasks
         self._ha_restrictions = None if ha_restrictions is None else MappingProxyType({key: tuple(value) if isinstance(value, (list, tuple)) else value for key, value in ha_restrictions.items()})
+        self._fact_reader = fact_reader
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
         if not startup.ready:
@@ -294,7 +298,7 @@ class TextGateway:
     def deliver_stream_event(self, event: StreamEvent, deliver: Callable[[StreamEvent], None]) -> bool:
         """Serialize useful stream delivery with cancellation acknowledgement."""
         with self._synchronization.locked():
-            if event.type in {"ack", "content_delta", "proposal"}:
+            if event.type in {"ack", "content_delta", "proposal", "fact"}:
                 request = self._requests.get(event.request_id)
                 if request is None or self._is_fenced_locked(request):
                     return False
@@ -425,6 +429,26 @@ class TextGateway:
                         yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
                         yield self._terminal(request, "outcome_unknown")
                         return
+                    if is_ha_fact_candidate(item.proposal):
+                        fact = self._read_fact(request, item.proposal)
+                        if fact is None:
+                            if self._is_fenced(request):
+                                yield self._terminal(request, "cancelled")
+                                return
+                            yield self._error(request, "ha_fact_denied", "policy_denial", "The requested home fact is unavailable.", False)
+                            yield self._terminal(request, "denied")
+                            return
+                        saw_proposal = True
+                        yield fact
+                        rendered = _render_home_fact(fact.fact)
+                        delta = self._content_delta(request, rendered)
+                        if delta is None:
+                            yield self._terminal(request, "cancelled")
+                            return
+                        saw_content = True
+                        response_parts.append(rendered)
+                        yield delta
+                        continue
                     proposal = self._admit_proposal(request, item.proposal)
                     if proposal is None:
                         if is_ha_shaped_candidate(item.proposal):
@@ -513,6 +537,23 @@ class TextGateway:
                 return
             yield proposal
             result, terminal = self._complete_turn(request, text, supplied_context, "", enforce_deadline=False)
+        elif decision.route == "fact":
+            fact = self._read_fact(request, decision.fact_request or {})
+            if fact is None:
+                if self._is_fenced(request):
+                    yield self._terminal(request, "cancelled")
+                    return
+                yield self._error(request, "ha_fact_denied", "policy_denial", "The requested home fact is unavailable.", False)
+                yield self._terminal(request, "denied")
+                return
+            yield fact
+            rendered = _render_home_fact(fact.fact)
+            delta = self._content_delta(request, rendered)
+            if delta is None:
+                yield self._terminal(request, "cancelled")
+                return
+            yield delta
+            result, terminal = self._complete_turn(request, text, supplied_context, rendered, enforce_deadline=False)
         else:
             content = decision.content
             if decision.route not in {"content", "clarification", "limitation"} or content is None:
@@ -585,6 +626,31 @@ class TextGateway:
                 return None
             self._mark_useful_output_locked(request)
             return self._event(request, "proposal", proposal=proposal)
+
+    def _fact_event(self, request: _Request, fact: BoundedHomeFact) -> StreamEvent | None:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return None
+            self._mark_useful_output_locked(request)
+            return self._event(request, "fact", fact=fact.payload())
+
+    def _read_fact(self, request: _Request, candidate: object) -> StreamEvent | None:
+        """Use the closed fact validator before the sole read adapter can run."""
+        validation = validate_ha_fact_request(candidate, self._ha_restrictions)
+        if validation.request is None:
+            try:
+                self._telemetry.emit("ha_fact_denied", {"code": validation.denial_code or "invalid_fact_request"})
+            except Exception:
+                pass
+            return None
+        fact = BoundedHomeFact.unavailable()
+        if self._fact_reader is not None:
+            try:
+                supplied = self._fact_reader.read(validation.request)
+                fact = supplied if type(supplied) is BoundedHomeFact else BoundedHomeFact.unavailable()
+            except Exception:
+                fact = BoundedHomeFact.unavailable()
+        return self._fact_event(request, fact)
 
     def _admit_proposal(self, request: _Request, proposal: Mapping[str, object]) -> StreamEvent | None:
         """Apply the one application proposal boundary shared by every route."""
@@ -869,6 +935,20 @@ def _utf8_length(value: object) -> int | None:
         return len(value.encode("utf-8"))
     except UnicodeError:
         return None
+
+
+def _render_home_fact(fact: Mapping[str, str | None] | None) -> str:
+    """Render the bounded observation without naming a provider or target."""
+    if fact is None or fact.get("freshness") == "unavailable":
+        return "The reviewed home fact is unavailable."
+    state = fact.get("power_state")
+    observed_at = fact.get("observed_at")
+    freshness = fact.get("freshness")
+    if state not in {"on", "off"} or not isinstance(observed_at, str):
+        return "The reviewed home fact is unavailable."
+    if freshness == "fresh":
+        return f"The reviewed home fact is fresh: power is {state}, observed at {observed_at}."
+    return f"The reviewed home fact is stale: power was {state}, observed at {observed_at}."
 
 
 def _provider_item_is_useful(item: object) -> bool:

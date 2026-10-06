@@ -315,6 +315,27 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(model_up.ready)
         self.assertEqual(model_up.components["ha"], {"state": "ready"})
 
+    def test_main_composes_a_ready_optional_ha_fact_reader(self):
+        class CapturingServer:
+            instance = None
+
+            def __init__(self, startup, gateway, host, port):
+                del host, port
+                self.startup = startup
+                self.gateway = gateway
+                CapturingServer.instance = self
+
+            def serve_forever(self):
+                self.events = list(self.gateway.begin_turn(self.gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+
+            def close(self):
+                return None
+
+        startup, profile = _compose_startup(optional_ha_probe=lambda: True)
+        with tempfile.TemporaryDirectory() as directory, patch("oriel.__main__._compose_startup", return_value=(startup, profile)), patch("oriel.__main__.HealthServer", CapturingServer):
+            self.assertEqual(main(["--ledger", str(Path(directory) / "ledger.sqlite3")]), 0)
+        self.assertEqual(CapturingServer.instance.events[1].fact, {"power_state": "off", "observed_at": "2026-10-05T00:00:00Z", "freshness": "fresh"})
+
     def test_ha_worker_channel_selection_reads_only_its_non_secret_private_setting(self):
         with tempfile.TemporaryDirectory() as directory:
             channel = Path(directory) / "worker.sock"

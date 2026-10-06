@@ -9,7 +9,7 @@ from typing import Callable, Mapping
 from types import MappingProxyType
 
 from .adapters.bootstrap import CleanupTrigger, DisabledTools, FakeModel, FixedClock, InMemoryRequestLedger, NoopTelemetry, RuntimeClock, SecureIds, SequentialIds, ThreadingScheduler, ThreadingTasks, ThreadSafeSynchronization, UnavailableRequestLedger, VolatileState
-from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver, select_ha_worker_channel
+from .adapters.configuration import OpenAICompatibleProfile, ProfileUnavailable, ResolvedProviderProfile, activate_startup, provider_profile_resolver, select_ha_worker_channel, synthetic_ha_fact_reader
 from .adapters.ha_worker import UnixHaWorkerClient
 from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
@@ -95,7 +95,7 @@ def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> b
 def run_self_test(config_path: str | None = None) -> dict[str, object]:
     """Exercise local health and the injected fake model without external I/O."""
     startup, _profile = _compose_startup(config_path)
-    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), ha_restrictions=_ha_restrictions(startup.config))
+    core = TextGateway(FakeModel(), FixedClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SequentialIds(), ThreadSafeSynchronization(), InMemoryRequestLedger(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state))
     server = HealthServer(startup, core)
     server.start()
     try:
@@ -123,11 +123,11 @@ def main(argv: list[str] | None = None) -> int:
     startup, _profile = _compose_startup(args.config)
     try:
         ledger = SQLiteRequestLedger(args.ledger)
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config))
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state))
         gateway.recover_interrupted_requests()
     except RequestLedgerUnavailable:
         ledger = UnavailableRequestLedger()
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config))
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state))
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()
