@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 mutants/
+oriel-*.sqlite3
+oriel-*.sqlite3.lock

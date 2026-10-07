@@ -25,10 +25,10 @@ FIXTURES = {
               "cancelled-stream": "cancelled_stream", "caps": "caps",
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
-              "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
+              "action-reservation": "action_reservation", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
                 "cancellation-outcome": "cancellation_outcome", "out-of-order-sequence": "invalid_sequence", "passive-status-outcome": "passive_status_outcome", "post-terminal": "post_terminal",
-                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview"},
+                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview", "invalid-action-state": "invalid_action_state"},
 }
 FIXTURE_NAMES = frozenset(name for group in FIXTURES.values() for name in group.values())
 
@@ -212,6 +212,19 @@ def validate_stream(events, path="events"):
                 preview_proposal = None
         elif "preview" in event:
             errors.append(loc + ".preview: only validation may carry preview")
+        if kind == "action_state":
+            if "action_state" not in event:
+                errors.append(loc + ".action_state: action_state event requires payload")
+            else:
+                _validate_action_state(event["action_state"], loc + ".action_state", errors)
+                for key in ("content", "proposal", "preview", "error", "outcome"):
+                    if key in event:
+                        errors.append(loc + "." + key + ": action_state may not carry other payload")
+                for key in ("request_id", "trace_id"):
+                    if event["action_state"].get(key) != event[key]:
+                        errors.append(loc + ".action_state." + key + ": must match stream identity")
+        elif "action_state" in event:
+            errors.append(loc + ".action_state: only action_state may carry action state")
         if kind == "error":
             if "error" not in event:
                 errors.append(loc + ".error: error event requires error")
@@ -330,6 +343,38 @@ def _validate_preview(value, path, errors):
         expected_reason = "adapter_rejected" if status == "denied" else "adapter_unavailable"
         if value.get("reason") != expected_reason:
             errors.append(path + ".reason: invalid preview reason")
+
+
+def _validate_action_state(value, path, errors):
+    if not _keys(value, ("state", "readiness"), path, errors,
+                 optional=("action_id", "request_id", "trace_id", "manifest_revision", "capability_id", "existing_state")):
+        return
+    state = value["state"]
+    if state not in ("reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied"):
+        errors.append(path + ".state: invalid action state")
+        return
+    if value["readiness"] not in ("ready", "degraded"):
+        errors.append(path + ".readiness: invalid readiness")
+    identifiers = ("action_id", "request_id", "trace_id")
+    if state == "denied":
+        for key in identifiers:
+            if key in value:
+                errors.append(path + "." + key + ": denied action state must not identify an action")
+    else:
+        for key in identifiers:
+            if key not in value:
+                errors.append(path + "." + key + ": action state requires identifier")
+            else:
+                _id(value[key], path + "." + key, errors)
+        if value.get("manifest_revision") != "home_assistant.harmless_light.v1":
+            errors.append(path + ".manifest_revision: unsupported revision")
+        if value.get("capability_id") != "home_assistant.harmless_light":
+            errors.append(path + ".capability_id: unsupported capability")
+    if state in ("duplicate", "conflict"):
+        if value.get("existing_state") not in ("reserved", "fake_attempted", "outcome_unknown"):
+            errors.append(path + ".existing_state: duplicate/conflict requires known state")
+    elif "existing_state" in value:
+        errors.append(path + ".existing_state: only duplicate/conflict may carry existing state")
 
 
 def validate_turn(turn, path="turn"):

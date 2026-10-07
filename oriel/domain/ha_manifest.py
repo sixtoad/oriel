@@ -8,6 +8,7 @@ from typing import Mapping
 MANIFEST_REVISION = "home_assistant.harmless_light.v1"
 OPERATION_ID = "home_assistant.light.set_power.v1"
 TARGET_ALIAS = "synthetic:reviewed-harmless-light"
+CAPABILITY_ID = "home_assistant.harmless_light"
 READ_FIELDS = frozenset(("power_state", "observed_at", "freshness"))
 DESIRED_STATES = frozenset(("on", "off"))
 INITIAL_DEADLINE_SECONDS = 5

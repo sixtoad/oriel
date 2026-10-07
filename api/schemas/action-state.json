@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/action-state.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["state", "readiness"],
+  "properties": {
+    "state": {"enum": ["reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied"]},
+    "readiness": {"enum": ["ready", "degraded"]},
+    "action_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "request_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
+    "manifest_revision": {"const": "home_assistant.harmless_light.v1"},
+    "capability_id": {"const": "home_assistant.harmless_light"},
+    "existing_state": {"enum": ["reserved", "fake_attempted", "outcome_unknown"]}
+  },
+  "allOf": [
+    {"if": {"properties": {"state": {"const": "denied"}}}, "then": {"not": {"anyOf": [{"required": ["action_id"]}, {"required": ["request_id"]}, {"required": ["trace_id"]}]}}},
+    {"if": {"properties": {"state": {"enum": ["reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown"]}}}, "then": {"required": ["action_id", "request_id", "trace_id", "manifest_revision", "capability_id"]}},
+    {"if": {"properties": {"state": {"enum": ["duplicate", "conflict"]}}}, "then": {"required": ["existing_state"]}, "else": {"not": {"required": ["existing_state"]}}}
+  ]
+}
