@@ -16,6 +16,14 @@ from scripts.validate_api_contract import load_json, validate_directory, validat
 
 
 class ApiContractTests(unittest.TestCase):
+    def test_malformed_action_state_reports_errors_without_crashing(self):
+        for payload in (None, [], "reserved", 1):
+            with self.subTest(payload=payload):
+                events = copy.deepcopy(load_json(EXAMPLES / "valid" / "accepted-stream.json")["events"])
+                events[2].pop("content")
+                events[2].update(type="action_state", action_state=payload)
+                self.assertTrue(validate_stream(events))
+
     def cli(self, directory=EXAMPLES, offline_guard=False):
         if offline_guard:
             guard = (
@@ -32,7 +40,7 @@ class ApiContractTests(unittest.TestCase):
     def test_fixture_matrix_is_validated_offline(self):
         result = self.cli(offline_guard=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "Valid API contract fixtures: 14 valid; 9 invalid.\n")
+        self.assertEqual(result.stdout, "Valid API contract fixtures: 15 valid; 10 invalid.\n")
         self.assertEqual(result.stderr, "")
 
     def test_every_matrix_fixture_has_its_expected_result(self):
@@ -95,6 +103,11 @@ class ApiContractTests(unittest.TestCase):
         fact_stream = load_json(EXAMPLES / "valid" / "home-fact-stream.json")["events"]
         fact_stream[2]["fact"] = fact_stream[1]["fact"]
         self.assertIn("only fact events", "\n".join(validate_stream(fact_stream)))
+
+        action_stream = load_json(EXAMPLES / "valid" / "action-reservation.json")["events"]
+        self.assertEqual(validate_stream(action_stream), [])
+        action_stream[3]["action_state"].pop("action_id")
+        self.assertIn("requires identifier", "\n".join(validate_stream(action_stream)))
 
     def test_closed_documents_and_caps_reject_extensions_or_overflow(self):
         config = load_json(EXAMPLES / "valid" / "config-precedence.json")

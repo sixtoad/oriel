@@ -9,6 +9,7 @@ MANIFEST_REVISION = "home_assistant.harmless_light.v1"
 OPERATION_ID = "home_assistant.light.set_power.v1"
 FACT_OPERATION_ID = "home_assistant.light.read_fact.v1"
 TARGET_ALIAS = "synthetic:reviewed-harmless-light"
+CAPABILITY_ID = "home_assistant.harmless_light"
 READ_FIELD_ORDER = ("power_state", "observed_at", "freshness")
 READ_FIELDS = frozenset(READ_FIELD_ORDER)
 DESIRED_STATES = frozenset(("on", "off"))
