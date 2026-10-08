@@ -32,7 +32,7 @@ class ApiContractTests(unittest.TestCase):
     def test_fixture_matrix_is_validated_offline(self):
         result = self.cli(offline_guard=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "Valid API contract fixtures: 13 valid; 8 invalid.\n")
+        self.assertEqual(result.stdout, "Valid API contract fixtures: 14 valid; 9 invalid.\n")
         self.assertEqual(result.stderr, "")
 
     def test_every_matrix_fixture_has_its_expected_result(self):

@@ -705,7 +705,10 @@ class TextGateway:
     def _preview_ha_proposal(self, request: _Request, proposal: CanonicalProposal) -> tuple[StreamEvent | None, str | None]:
         if self._is_fenced(request):
             return None, "cancelled"
-        result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable") if self._ha_preview is None else self._ha_preview.preview(proposal)
+        try:
+            result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable") if self._ha_preview is None else self._ha_preview.preview(proposal)
+        except Exception:
+            result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
         if type(result) is not DryRunPreview or not _preview_matches_proposal(result, proposal):
             result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
         with self._synchronization.locked():

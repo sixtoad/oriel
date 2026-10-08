@@ -101,22 +101,22 @@ class FactValidationResult:
         return self.request is not None
 
 
-def compute_effective_policy(restrictions: Mapping[str, object] | None = None) -> PolicyResult:
+def compute_effective_policy(restrictions: Mapping[str, object] | None = None, manifest: BuiltInManifest = BUILT_IN_MANIFEST) -> PolicyResult:
     """Intersect typed optional-skill restrictions with the built-in policy."""
     if restrictions is None:
-        return PolicyResult(_effective(BUILT_IN_MANIFEST.targets, BUILT_IN_MANIFEST.read_fields))
+        return PolicyResult(_effective(manifest.targets, manifest.read_fields, manifest))
     if not isinstance(restrictions, Mapping) or set(restrictions) - {"targets", "read_fields"}:
         return PolicyResult(denial_code="invalid_operator_restrictions")
-    targets = _members(restrictions.get("targets", BUILT_IN_MANIFEST.targets))
-    fields = _members(restrictions.get("read_fields", BUILT_IN_MANIFEST.read_fields))
+    targets = _members(restrictions.get("targets", manifest.targets))
+    fields = _members(restrictions.get("read_fields", manifest.read_fields))
     if targets is None or fields is None:
         return PolicyResult(denial_code="invalid_operator_restrictions")
-    return PolicyResult(_effective(BUILT_IN_MANIFEST.targets & targets, BUILT_IN_MANIFEST.read_fields & fields))
+    return PolicyResult(_effective(manifest.targets & targets, manifest.read_fields & fields, manifest))
 
 
-def validate_ha_proposal(candidate: object, restrictions: Mapping[str, object] | None = None) -> ValidationResult:
+def validate_ha_proposal(candidate: object, restrictions: Mapping[str, object] | None = None, manifest: BuiltInManifest = BUILT_IN_MANIFEST) -> ValidationResult:
     """Validate a closed HA request without granting dispatch authority."""
-    policy_result = compute_effective_policy(restrictions)
+    policy_result = compute_effective_policy(restrictions, manifest)
     if policy_result.policy is None:
         return ValidationResult(denial_code=policy_result.denial_code)
     policy = policy_result.policy
@@ -198,8 +198,15 @@ def canonical_ha_fact_request() -> dict[str, object]:
     return {"operation": FACT_OPERATION_ID, "target": TARGET_ALIAS, "fields": list(READ_FIELD_ORDER)}
 
 
-def _effective(targets: frozenset[str], fields: frozenset[str]) -> EffectivePolicy:
-    return EffectivePolicy(BUILT_IN_MANIFEST.revision, BUILT_IN_MANIFEST.operation, targets, fields, False)
+def preview_eligibility(candidate: object, restrictions: Mapping[str, object] | None = None, manifest: BuiltInManifest = BUILT_IN_MANIFEST) -> ValidationResult:
+    result = validate_ha_proposal(candidate, restrictions, manifest)
+    if result.denial_code is not None or result.policy is None or not result.policy.enabled:
+        return ValidationResult(policy=result.policy, denial_code=result.denial_code or "action_disabled")
+    return result
+
+
+def _effective(targets: frozenset[str], fields: frozenset[str], manifest: BuiltInManifest = BUILT_IN_MANIFEST) -> EffectivePolicy:
+    return EffectivePolicy(manifest.revision, manifest.operation, targets, fields, manifest.enabled)
 
 
 def _members(value: object) -> frozenset[str] | None:
