@@ -268,6 +268,14 @@ class TextClient:
                 self._line("proposal: UNTRUSTED DRY-RUN=" + self._display(proposal.get("dry_run", "unknown")) + " " + " ".join(f"{name}={self._display(proposal.get(name, 'unknown'))}" for name in ("proposal_id", "action", "target")))
             else:
                 self._line("proposal: UNTRUSTED DRY-RUN malformed event")
+        elif event_type == "validation":
+            preview = payload.get("preview")
+            if isinstance(preview, Mapping):
+                status = self._display(preview.get("status", "unknown"))
+                fields = [f"{name}={self._display(preview[name])}" for name in ("operation", "target", "manifest_revision", "reason") if name in preview]
+                self._line("preview: " + status + (" " + " ".join(fields) if fields else ""))
+            else:
+                self._line("preview: malformed event")
         elif event_type == "error":
             error = payload.get("error")
             if isinstance(error, Mapping):

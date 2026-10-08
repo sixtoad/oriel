@@ -104,6 +104,13 @@ class HarmlessHomeAssistantSkillTests(unittest.TestCase):
         })
         self.assertFalse(self.contract["execution"]["enabled"])
 
+    def test_dry_run_is_simulated_and_does_not_enable_execution(self) -> None:
+        self.assertEqual(self.contract["dry_run"], {
+            "result": "simulated",
+            "requires_test_injected_enabled_manifest": True,
+            "dispatch_expectation": 0,
+        })
+
 
     def test_permission_gate_and_idempotency_require_evidence_without_broadening_access(self) -> None:
         self.assertEqual(self.contract["permission_prerequisite"], {
