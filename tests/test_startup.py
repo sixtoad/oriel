@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import subprocess
+import sys
 import tempfile
 import time
 from threading import Barrier, Thread
@@ -11,7 +14,7 @@ from oriel.adapters.bootstrap import ThreadSafeSynchronization
 from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path, select_ha_worker_channel
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ActivationConflict, ActivationRejected, ActivationSucceeded, ConfigurationService, READY_PROFILE_LABEL
-from oriel.application.ports import RequestStatusRecord
+from oriel.application.ports import ActionLedgerUnavailable, RequestStatusRecord
 from oriel.application.startup import UNREADY_CODE
 from oriel.application.text_gateway import AdmissionError
 from oriel.domain.configuration import CoreConfig, parse_core_config
@@ -335,6 +338,64 @@ class StartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("oriel.__main__._compose_startup", return_value=(startup, profile)), patch("oriel.__main__.HealthServer", CapturingServer):
             self.assertEqual(main(["--ledger", str(Path(directory) / "ledger.sqlite3")]), 0)
         self.assertEqual(CapturingServer.instance.events[1].fact, {"power_state": "off", "observed_at": "2026-10-05T00:00:00Z", "freshness": "fresh"})
+
+    def test_main_recovers_both_ledgers_before_serving_without_replay(self):
+        crash = "from tests.test_action_fences import crash_gateway; import sys; crash_gateway(sys.argv[1], sys.argv[2])"
+        reopen = """
+import json, sys
+from pathlib import Path
+from unittest.mock import patch
+from oriel.__main__ import main
+from tests.test_action_fences import Clock, NOW
+p = Path(sys.argv[1]); expected = sys.argv[2]
+request_id = (p / "request-id").read_text()
+class InspectServer:
+    def __init__(self, startup, gateway, host, port):
+        self.gateway = gateway
+        self.status = gateway.request_status(request_id)
+        assert self.status["outcome"] == expected, self.status
+        assert self.status["state"] == "terminal"
+        assert not gateway._requests
+        assert gateway._fake_action_dispatch is None
+    def serve_forever(self):
+        print(json.dumps(self.gateway.request_status(request_id)))
+    def close(self): pass
+with patch("oriel.__main__.HealthServer", InspectServer), patch("oriel.__main__.RuntimeClock", side_effect=lambda: Clock(NOW)):
+    assert main(["--ledger", str(p / "requests.db"), "--action-ledger", str(p / "actions.db")]) == 0
+"""
+        for boundary in ("before", "reserved", "attempt", "persisted", "recovery"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                crashed = subprocess.run([sys.executable, "-c", crash, directory, boundary], capture_output=True)
+                self.assertEqual(crashed.returncode, 23, crashed.stderr)
+                counter = Path(directory) / "attempts"
+                attempts = counter.read_text() if counter.exists() else ""
+                self.assertEqual(attempts.count("attempt"), int(boundary in {"attempt", "persisted"}))
+                expected = "failed" if boundary == "before" else "outcome_unknown"
+                for _ in range(2):
+                    result = subprocess.run([sys.executable, "-c", reopen, directory, expected], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["outcome"], expected)
+                    self.assertEqual(counter.read_text() if counter.exists() else "", attempts)
+
+    def test_action_recovery_failure_blocks_admission_before_request_reconciliation(self):
+        class CapturingServer:
+            def __init__(self, startup, gateway, host, port):
+                self.startup, self.gateway = startup, gateway
+            def serve_forever(inner):
+                with self.assertRaises(AdmissionError):
+                    inner.gateway.begin_turn(inner.gateway.create_session().session_id, {"input": "hello"}, inner.startup)
+            def close(self): pass
+        startup, profile = _compose_startup()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.db"
+            ledger = SQLiteRequestLedger(path)
+            ledger.reserve(RequestStatusRecord("request-1", "session-1", "trace-1", 0, "in_progress", None, "2026-10-07T00:00:00Z", "2026-10-09T00:00:00Z"))
+            ledger.close()
+            with patch("oriel.__main__._compose_startup", return_value=(startup, profile)), patch("oriel.__main__.SQLiteActionLedger", side_effect=ActionLedgerUnavailable()), patch("oriel.__main__.HealthServer", CapturingServer):
+                self.assertEqual(main(["--ledger", str(path)]), 0)
+            ledger = SQLiteRequestLedger(path)
+            self.addCleanup(ledger.close)
+            self.assertEqual(ledger.lookup("request-1", "2026-10-08T00:00:00Z").state, "in_progress")
 
     def test_ha_worker_channel_selection_reads_only_its_non_secret_private_setting(self):
         with tempfile.TemporaryDirectory() as directory:

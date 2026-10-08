@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import tempfile
 from threading import Barrier, Thread
 import unittest
@@ -58,6 +59,33 @@ class SQLiteActionLedgerTests(unittest.TestCase):
                 worker.join()
             self.assertEqual(sorted(results), ["duplicate", "reserved"])
             self.assertEqual(ledger.audit_events("action-1"), (("reserved", "2026-10-07T10:00:00Z"),))
+
+    def test_persisted_degradation_wins_before_new_reservation_but_duplicates_survive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = SQLiteActionLedger(Path(directory) / "actions.sqlite3")
+            self.addCleanup(ledger.close)
+            ledger.reserve_and_audit(record())
+            self.assertEqual(ledger.readiness().state, "ready")
+            # A separate committed storage write lands after the caller's readiness read.
+            with ledger._connect() as connection:
+                connection.execute("UPDATE action_readiness SET state = 'degraded' WHERE singleton = 1")
+            with self.assertRaises(ActionLedgerUnavailable):
+                ledger.reserve_and_audit(replace(record(), action_id="action-2", request_id="request-2"))
+            self.assertEqual(ledger.reserve_and_audit(record()).status, "duplicate")
+            with ledger._connect() as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM action_ledger").fetchone()[0], 1)
+
+    def test_recovery_audit_failure_rolls_back_and_degrades(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = SQLiteActionLedger(Path(directory) / "actions.sqlite3")
+            self.addCleanup(ledger.close)
+            ledger.reserve_and_audit(record())
+            with ledger._connect() as connection:
+                connection.execute("CREATE TRIGGER reject_recovery BEFORE INSERT ON action_audit WHEN NEW.event = 'outcome_unknown' BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+            with self.assertRaises(ActionLedgerUnavailable):
+                ledger.recover_unresolved("2026-10-07T10:00:01Z")
+            self.assertEqual(ledger.reserve_and_audit(record()).record.state, "reserved")
+            self.assertEqual(ledger.readiness().state, "degraded")
 
     def test_failed_result_write_degrades_readiness_without_creating_a_second_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
