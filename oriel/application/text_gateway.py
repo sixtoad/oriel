@@ -4,14 +4,15 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Callable, Iterable, Iterator, Mapping
 from types import MappingProxyType
 
 from .fast_router import FastRoute, route as select_fast_route
-from .ports import BackgroundTaskPort, BoundedHomeFact, CancellationSignal, Clock, DryRunPreview, DryRunPreviewPort, HomeFactReaderPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import ActionLedgerPort, ActionLedgerUnavailable, ActionRecord, BackgroundTaskPort, BoundedHomeFact, HomeFactReaderPort, CancellationSignal, Clock, DryRunPreview, DryRunPreviewPort, FakeActionDispatchPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
-from ..domain.ha_manifest import BUILT_IN_MANIFEST, BuiltInManifest, CanonicalProposal, is_ha_fact_candidate, is_ha_shaped_candidate, preview_eligibility, validate_ha_fact_request
+from ..domain.ha_manifest import BUILT_IN_MANIFEST, CAPABILITY_ID, BuiltInManifest, CanonicalProposal, is_ha_fact_candidate, validate_ha_fact_request, is_ha_shaped_candidate, preview_eligibility
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
@@ -64,6 +65,7 @@ class StreamEvent:
     proposal: Mapping[str, object] | None = None
     fact: Mapping[str, str | None] | None = None
     preview: Mapping[str, object] | None = None
+    action_state: Mapping[str, object] | None = None
     error: Mapping[str, object] | None = None
     outcome: str | None = None
 
@@ -79,6 +81,8 @@ class StreamEvent:
             payload["fact"] = dict(self.fact)
         if self.preview is not None:
             payload["preview"] = dict(self.preview)
+        if self.action_state is not None:
+            payload["action_state"] = dict(self.action_state)
         if self.error is not None:
             payload["error"] = dict(self.error)
         if self.outcome is not None:
@@ -129,7 +133,7 @@ class _Request:
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, fact_reader: HomeFactReaderPort | None = None, ha_manifest: BuiltInManifest = BUILT_IN_MANIFEST, ha_preview: DryRunPreviewPort | None = None) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, ha_manifest: BuiltInManifest = BUILT_IN_MANIFEST, ha_preview: DryRunPreviewPort | None = None, action_ledger: ActionLedgerPort | None = None, fake_action_dispatch: FakeActionDispatchPort | None = None, fact_reader: HomeFactReaderPort | None = None) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -149,6 +153,8 @@ class TextGateway:
         self._fact_reader = fact_reader
         self._ha_manifest = ha_manifest
         self._ha_preview = ha_preview
+        self._action_ledger = action_ledger
+        self._fake_action_dispatch = fake_action_dispatch
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
         if not startup.ready:
@@ -303,7 +309,7 @@ class TextGateway:
     def deliver_stream_event(self, event: StreamEvent, deliver: Callable[[StreamEvent], None]) -> bool:
         """Serialize useful stream delivery with cancellation acknowledgement."""
         with self._synchronization.locked():
-            if event.type in {"ack", "content_delta", "proposal", "fact", "validation"}:
+            if event.type in {"ack", "content_delta", "proposal", "fact", "validation", "action_state"}:
                 request = self._requests.get(event.request_id)
                 if request is None or self._is_fenced_locked(request):
                     return False
@@ -467,7 +473,7 @@ class TextGateway:
                     proposal, canonical_preview = admitted
                     yield proposal
                     if canonical_preview is not None:
-                        preview_event, terminal_outcome = self._preview_ha_proposal(request, canonical_preview)
+                        preview_event, terminal_outcome, preview_succeeded = self._preview_ha_proposal(request, canonical_preview)
                         if preview_event is None:
                             yield self._terminal(request, "cancelled")
                             return
@@ -475,14 +481,26 @@ class TextGateway:
                         if terminal_outcome is not None:
                             yield self._terminal(request, terminal_outcome)
                             return
-                    record_result, terminal = self._complete_turn(request, text, supplied_context, "")
-                    if record_result == "fenced":
-                        yield self._terminal(request, "cancelled")
-                    elif terminal is not None:
-                        yield terminal
-                    else:
-                        yield self._terminal(request, "failed")
-                    return
+                        if preview_succeeded:
+                            action_events, action_outcome = self._reserve_fake_action(request, canonical_preview)
+                            yield from action_events
+                            if action_outcome is not None:
+                                yield self._terminal(request, action_outcome)
+                                return
+                        record_result, terminal = self._complete_turn(request, text, supplied_context, "")
+                        if record_result == "fenced":
+                            yield self._terminal(request, "cancelled")
+                        elif record_result == "deadline":
+                            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                            yield self._terminal(request, "failed")
+                        elif record_result == "limit":
+                            yield self._error(request, "transcript_limit", "internal_failure", "Response exceeded a context limit.", False)
+                            yield self._terminal(request, "failed")
+                        elif terminal is not None:
+                            yield terminal
+                        else:
+                            raise RuntimeError("completed preview is missing its terminal event")
+                        return
                 elif isinstance(item, ModelOutcome):
                     if saw_outcome:
                         yield self._error(request, "invalid_outcome", "uncertainty", "Model outcome is unavailable.", False)
@@ -561,7 +579,7 @@ class TextGateway:
             proposal, canonical_preview = admitted
             yield proposal
             if canonical_preview is not None:
-                preview_event, terminal_outcome = self._preview_ha_proposal(request, canonical_preview)
+                preview_event, terminal_outcome, preview_succeeded = self._preview_ha_proposal(request, canonical_preview)
                 if preview_event is None:
                     yield self._terminal(request, "cancelled")
                     return
@@ -569,6 +587,12 @@ class TextGateway:
                 if terminal_outcome is not None:
                     yield self._terminal(request, terminal_outcome)
                     return
+                if preview_succeeded:
+                    action_events, action_outcome = self._reserve_fake_action(request, canonical_preview)
+                    yield from action_events
+                    if action_outcome is not None:
+                        yield self._terminal(request, action_outcome)
+                        return
             result, terminal = self._complete_turn(request, text, supplied_context, "", enforce_deadline=False)
         elif decision.route == "fact":
             fact = self._read_fact(request, decision.fact_request or {})
@@ -686,37 +710,88 @@ class TextGateway:
         return self._fact_event(request, fact)
 
     def _admit_proposal(self, request: _Request, proposal: Mapping[str, object]) -> tuple[StreamEvent, CanonicalProposal | None] | None:
-        """Apply the shared proposal boundary and isolate canonical HA previews."""
+        """Apply the one application proposal boundary shared by every route."""
         if is_ha_shaped_candidate(proposal):
             result = preview_eligibility(proposal, self._ha_restrictions, self._ha_manifest)
-            if result.denial_code is not None or result.material is None:
+            if result.denial_code is not None:
                 try:
-                    self._telemetry.emit("ha_proposal_denied", {"code": result.denial_code or "invalid_proposal"})
+                    self._telemetry.emit("ha_proposal_denied", {"code": result.denial_code})
                 except Exception:
                     pass
                 return None
+            if result.material is None:
+                return None
             event = self._proposal_event(request, _canonical_proposal_payload(result.material))
-            return None if event is None else (event, result.material)
+            if event is None:
+                return None
+            return event, result.material
         if not validate_proposal(proposal) or not proposal_event_size_is_bounded(proposal):
             return None
         event = self._proposal_event(request, proposal)
         return None if event is None else (event, None)
 
-    def _preview_ha_proposal(self, request: _Request, proposal: CanonicalProposal) -> tuple[StreamEvent | None, str | None]:
+    def _preview_ha_proposal(self, request: _Request, proposal: CanonicalProposal) -> tuple[StreamEvent | None, str | None, bool]:
+        """Preview through the inward adapter; this path never reaches tools."""
         if self._is_fenced(request):
-            return None, "cancelled"
-        try:
-            result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable") if self._ha_preview is None else self._ha_preview.preview(proposal)
-        except Exception:
+            return None, "cancelled", False
+        if self._ha_preview is None:
             result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
+        else:
+            try:
+                result = self._ha_preview.preview(proposal)
+            except Exception:
+                result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
         if type(result) is not DryRunPreview or not _preview_matches_proposal(result, proposal):
             result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
+        if self._is_fenced(request):
+            return None, "cancelled", False
+        preview = _preview_payload(result)
+        event = self._validation_event(request, preview)
+        if result.status == "simulated":
+            return event, None, True
+        return event, "denied" if result.status == "denied" else "failed", False
+
+    def _reserve_fake_action(self, request: _Request, proposal: CanonicalProposal) -> tuple[tuple[StreamEvent, ...], str | None]:
+        """Run only an injected test fake after ordinary preview eligibility."""
+        if self._action_ledger is None or self._fake_action_dispatch is None:
+            return (), None
+        if self._is_fenced(request):
+            return (), "cancelled"
+        record = _new_action_record(request, proposal, self._clock.now())
+        try:
+            reservation = self._action_ledger.reserve_and_audit(record)
+        except ActionLedgerUnavailable:
+            self._action_ledger.degrade()
+            return (self._action_state_event(request, {"state": "denied", "readiness": "degraded"}),), "denied"
+        reservation_event = self._action_state_event(request, _action_state_payload(reservation.status, reservation.record, self._action_ledger.readiness().state))
+        if reservation.status == "conflict":
+            return (reservation_event,), "denied"
+        if reservation.status == "duplicate":
+            return (reservation_event,), None
+        if self._is_fenced(request):
+            return (), "cancelled"
+        try:
+            self._fake_action_dispatch.attempt(reservation.record)
+            attempted = self._action_ledger.mark_fake_attempt(reservation.record.action_id, self._clock.now())
+        except Exception:
+            self._action_ledger.degrade()
+            try:
+                unknown = self._action_ledger.mark_outcome_unknown(reservation.record.action_id, self._clock.now())
+            except ActionLedgerUnavailable:
+                unknown = reservation.record
+            return (reservation_event, self._action_state_event(request, _action_state_payload("outcome_unknown", unknown, "degraded"))), "outcome_unknown"
+        return (reservation_event, self._action_state_event(request, _action_state_payload("fake_attempted", attempted, self._action_ledger.readiness().state))), None
+
+    def _action_state_event(self, request: _Request, state: Mapping[str, object]) -> StreamEvent:
+        with self._synchronization.locked():
+            return self._event(request, "action_state", action_state=state)
+
+    def _validation_event(self, request: _Request, preview: Mapping[str, object]) -> StreamEvent | None:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
-                return None, "cancelled"
+                return None
             self._mark_useful_output_locked(request)
-            event = self._event(request, "validation", preview=_preview_payload(result))
-        return event, None if result.status == "simulated" else ("denied" if result.status == "denied" else "failed")
+            return self._event(request, "validation", preview=preview)
 
     def _schedule_acknowledgement(self, request: _Request) -> None:
         """Arm the one non-authoritative acknowledgement from durable admission."""
@@ -1001,17 +1076,69 @@ def _render_home_fact(fact: Mapping[str, str | None] | None) -> str:
 
 
 def _canonical_proposal_payload(proposal: CanonicalProposal) -> dict[str, object]:
-    return {"operation": proposal.operation, "target": proposal.target, "arguments": proposal.argument_object(), "manifest_revision": proposal.manifest_revision}
+    """Publish only the canonical reviewed operation material."""
+    return {
+        "operation": proposal.operation,
+        "target": proposal.target,
+        "arguments": proposal.argument_object(),
+        "manifest_revision": proposal.manifest_revision,
+    }
 
 
 def _preview_payload(result: DryRunPreview) -> dict[str, object]:
+    """Publish the closed simulated result without a state-change claim."""
+    payload: dict[str, object] = {"status": result.status}
     if result.status == "simulated":
-        return {"status": "simulated", "operation": result.operation, "target": result.target, "arguments": {"desired_state": result.desired_state}, "manifest_revision": result.manifest_revision}
-    return {"status": result.status, "reason": result.reason}
+        payload.update({
+            "operation": result.operation,
+            "target": result.target,
+            "arguments": {"desired_state": result.desired_state},
+            "manifest_revision": result.manifest_revision,
+        })
+    else:
+        payload["reason"] = result.reason
+    return payload
 
 
 def _preview_matches_proposal(result: DryRunPreview, proposal: CanonicalProposal) -> bool:
-    return result.status != "simulated" or (result.operation == proposal.operation and result.target == proposal.target and result.desired_state == proposal.argument_object().get("desired_state") and result.manifest_revision == proposal.manifest_revision)
+    """Keep an adapter result from contradicting the admitted canonical proposal."""
+    return result.status != "simulated" or (
+        result.operation == proposal.operation
+        and result.target == proposal.target
+        and result.desired_state == proposal.argument_object().get("desired_state")
+        and result.manifest_revision == proposal.manifest_revision
+    )
+
+
+def _new_action_record(request: _Request, proposal: CanonicalProposal, occurred_at: str) -> ActionRecord:
+    """Hash canonical material; never retain prompts, raw arguments, or labels."""
+    fields = (
+        CAPABILITY_ID, proposal.manifest_revision, proposal.operation, proposal.target,
+        *(value for pair in sorted(proposal.arguments) for value in pair),
+    )
+    # Length-prefix the typed string fields so separators in values cannot collide.
+    material = b"oriel-action-v1:" + b"".join(
+        str(len(encoded)).encode("ascii") + b":" + encoded
+        for encoded in (value.encode("utf-8") for value in fields)
+    )
+    fingerprint = hashlib.sha256(material).hexdigest()
+    action_id = "action-" + hashlib.sha256(f"{request.request_id}:{fingerprint}".encode("utf-8")).hexdigest()
+    return ActionRecord(action_id, request.request_id, request.trace_id, proposal.manifest_revision, CAPABILITY_ID, fingerprint, "reserved", occurred_at, occurred_at)
+
+
+def _action_state_payload(state: str, record: ActionRecord, readiness: str) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "state": state,
+        "action_id": record.action_id,
+        "request_id": record.request_id,
+        "trace_id": record.trace_id,
+        "manifest_revision": record.manifest_revision,
+        "capability_id": record.capability_id,
+        "readiness": readiness,
+    }
+    if state in {"duplicate", "conflict"}:
+        payload["existing_state"] = record.state
+    return payload
 
 
 def _provider_item_is_useful(item: object) -> bool:
@@ -1019,7 +1146,10 @@ def _provider_item_is_useful(item: object) -> bool:
     if isinstance(item, ModelChunk):
         size = _utf8_length(item.content)
         return size is not None and 0 < size <= MAX_STREAM_EVENT_CONTENT_BYTES
-    return isinstance(item, ModelProposal) and validate_proposal(item.proposal) and proposal_event_size_is_bounded(item.proposal)
+    return isinstance(item, ModelProposal) and (
+        is_ha_shaped_candidate(item.proposal)
+        or validate_proposal(item.proposal) and proposal_event_size_is_bounded(item.proposal)
+    )
 
 
 def _safe_model_failure(failure: ModelOperationFailure) -> tuple[str, str, str, bool]:

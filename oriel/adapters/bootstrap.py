@@ -7,7 +7,7 @@ from threading import Condition, Event, Lock, RLock, Thread, Timer as ThreadingT
 import time
 from typing import Callable, Iterable, Mapping
 
-from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
+from ..application.ports import ActionReadiness, ActionRecord, ActionReservation, CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
 
 
 class ThreadingScheduler:
@@ -261,6 +261,57 @@ class UnavailableRequestLedger:
 
     def recover_interrupted(self) -> None:
         raise RequestLedgerUnavailable()
+
+
+@dataclass
+class InMemoryActionLedger:
+    """Payload-free deterministic action ledger for focused tests only."""
+
+    records: dict[str, ActionRecord] = field(default_factory=dict)
+    audit: list[tuple[str, str, str]] = field(default_factory=list)
+    fail_reservation: bool = False
+    fail_result_write: bool = False
+    _degraded: bool = False
+
+    def reserve_and_audit(self, record: ActionRecord) -> ActionReservation:
+        if self.fail_reservation:
+            from ..application.ports import ActionLedgerUnavailable
+            raise ActionLedgerUnavailable()
+        existing = self.records.get(record.request_id)
+        if existing is not None:
+            return ActionReservation("duplicate" if existing.operation_fingerprint == record.operation_fingerprint else "conflict", existing)
+        self.records[record.request_id] = record
+        self.audit.append((record.action_id, "reserved", record.reserved_at))
+        return ActionReservation("reserved", record)
+
+    def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord:
+        return self._transition(action_id, occurred_at, "fake_attempted")
+
+    def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord:
+        return self._transition(action_id, occurred_at, "outcome_unknown")
+
+    def readiness(self) -> ActionReadiness:
+        return ActionReadiness("degraded" if self._degraded else "ready")
+
+    def degrade(self) -> None:
+        self._degraded = True
+
+    def _transition(self, action_id: str, occurred_at: str, state: str) -> ActionRecord:
+        from ..application.ports import ActionLedgerUnavailable
+        if self.fail_result_write:
+            self.degrade()
+            raise ActionLedgerUnavailable()
+        for request_id, record in self.records.items():
+            if record.action_id == action_id:
+                updated = ActionRecord(
+                    record.action_id, record.request_id, record.trace_id,
+                    record.manifest_revision, record.capability_id,
+                    record.operation_fingerprint, state, record.reserved_at, occurred_at,
+                )
+                self.records[request_id] = updated
+                self.audit.append((action_id, state, occurred_at))
+                return updated
+        raise ActionLedgerUnavailable()
 
 
 @dataclass

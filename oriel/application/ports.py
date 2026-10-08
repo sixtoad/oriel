@@ -296,3 +296,74 @@ class DryRunPreviewPort(Protocol):
     """Independently validates and simulates one already-canonical proposal."""
 
     def preview(self, proposal: object) -> DryRunPreview: ...
+
+
+@dataclass(frozen=True)
+class ActionRecord:
+    """Payload-free durable state for one server-owned synthetic action."""
+
+    action_id: str
+    request_id: str
+    trace_id: str
+    manifest_revision: str
+    capability_id: str
+    operation_fingerprint: str
+    state: str
+    reserved_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"reserved", "fake_attempted", "outcome_unknown"}:
+            raise ValueError("invalid action record state")
+        if not all(isinstance(value, str) and value for value in (
+            self.action_id, self.request_id, self.trace_id, self.manifest_revision,
+            self.capability_id, self.operation_fingerprint, self.reserved_at, self.updated_at,
+        )):
+            raise ValueError("invalid action record")
+
+
+@dataclass(frozen=True)
+class ActionReservation:
+    """The closed outcome of atomically reserving a synthetic action."""
+
+    status: str
+    record: ActionRecord
+
+    def __post_init__(self) -> None:
+        if self.status not in {"reserved", "duplicate", "conflict"}:
+            raise ValueError("invalid action reservation status")
+
+
+@dataclass(frozen=True)
+class ActionReadiness:
+    """Whether action recording can still make authoritative safety claims."""
+
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"ready", "degraded"}:
+            raise ValueError("invalid action readiness")
+
+
+class ActionLedgerUnavailable(RuntimeError):
+    """A durable action-ledger operation could not be completed."""
+
+
+class ActionLedgerPort(Protocol):
+    """Separates action reservation/audit from request lifecycle storage."""
+
+    def reserve_and_audit(self, record: ActionRecord) -> ActionReservation: ...
+
+    def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord: ...
+
+    def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord: ...
+
+    def readiness(self) -> ActionReadiness: ...
+
+    def degrade(self) -> None: ...
+
+
+class FakeActionDispatchPort(Protocol):
+    """A test-only, provider-free seam for one already-reserved fake attempt."""
+
+    def attempt(self, action: ActionRecord) -> None: ...
