@@ -18,7 +18,7 @@ from .adapters.http import HealthServer
 from .adapters.qwen import EnvironmentCredentialResolver, OpenAICompatibleStreamingModel
 from .adapters.request_ledger import SQLiteRequestLedger
 from .application.configuration import ConfigurationService
-from .application.ports import ActionLedgerUnavailable, CancellationSignal, ModelInput, ModelMessage, RequestLedgerUnavailable
+from .application.ports import ActionLedgerUnavailable, CancellationSignal, ModelChunk, ModelInput, ModelMessage, RequestLedgerUnavailable
 from .application.text_gateway import TextGateway
 from .domain.configuration import API_VERSION, CoreConfig
 from .domain.ha_manifest import BUILT_IN_MANIFEST
@@ -91,8 +91,8 @@ def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> b
         return False
     try:
         model = OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
-        next(iter(model.stream(ModelInput((ModelMessage("user", "Reply with exactly OK."),)), CancellationSignal())))
-        return True
+        stream = model.stream(ModelInput((ModelMessage("user", "Reply with exactly OK."),)), CancellationSignal())
+        return any(isinstance(item, ModelChunk) and item.content.strip() for item in stream)
     except Exception:
         return False
 

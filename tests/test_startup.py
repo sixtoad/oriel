@@ -11,14 +11,14 @@ import unittest
 from unittest.mock import patch
 
 from oriel.adapters.bootstrap import ThreadSafeSynchronization
-from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path, select_ha_worker_channel
+from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, OpenAICompatibleProfile, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path, select_ha_worker_channel
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ActivationConflict, ActivationRejected, ActivationSucceeded, ConfigurationService, READY_PROFILE_LABEL
-from oriel.application.ports import ActionLedgerUnavailable, RequestStatusRecord
+from oriel.application.ports import ActionLedgerUnavailable, ModelChunk, ModelOutcome, RequestStatusRecord
 from oriel.application.startup import UNREADY_CODE
 from oriel.application.text_gateway import AdmissionError
 from oriel.domain.configuration import CoreConfig, parse_core_config
-from oriel.__main__ import _compose_startup, _ha_restrictions, main
+from oriel.__main__ import _compose_startup, _ha_restrictions, _model_ready, main
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -418,6 +418,19 @@ with patch("oriel.__main__.HealthServer", InspectServer), patch("oriel.__main__.
             )
         self.assertLess(time.monotonic() - started, 0.25)
         self.assertFalse(state.ready)
+
+    def test_model_readiness_requires_nonempty_text_chunk(self):
+        profile = OpenAICompatibleProfile("http://private.invalid/stream", "revision", 1)
+        cases = (
+            ((), False),
+            ((ModelOutcome("completed"),), False),
+            ((ModelChunk("  "), ModelOutcome("completed")), False),
+            ((ModelChunk("OK"), ModelOutcome("completed")), True),
+        )
+        for items, expected in cases:
+            with self.subTest(items=items), patch("oriel.__main__.OpenAICompatibleStreamingModel") as model:
+                model.return_value.stream.return_value = iter(items)
+                self.assertIs(_model_ready(profile, {}), expected)
 
     def test_profile_resolution_is_selected_at_restart_not_live_rewired(self):
         with tempfile.TemporaryDirectory() as directory:
