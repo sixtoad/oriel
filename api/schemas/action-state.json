@@ -1,23 +1,617 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oriel.invalid/api/1.0/schemas/action-state.json",
-  "description": "After cancellation acknowledgement, a committed action may emit at most its reservation and one known fake-attempt or unknown result. No generated content or new proposal may follow. Unresolved commitment requires terminal outcome_unknown; fake_attempted never claims physical completion.",
+  "description": "A committed action emits its reservation and one bounded result. Confirmation requires durable fresh matching post-dispatch observation. Cancellation suppresses generated content but may retain confirmed evidence; uncertainty requires outcome_unknown and never retries.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["state", "readiness"],
+  "required": [
+    "state",
+    "readiness"
+  ],
   "properties": {
-    "state": {"enum": ["reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied"]},
-    "readiness": {"enum": ["ready", "degraded"]},
-    "action_id": {"$ref": "common.json#/$defs/opaque_id"},
-    "request_id": {"$ref": "common.json#/$defs/opaque_id"},
-    "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
-    "manifest_revision": {"const": "home_assistant.harmless_light.v1"},
-    "capability_id": {"const": "home_assistant.harmless_light"},
-    "existing_state": {"enum": ["reserved", "fake_attempted", "outcome_unknown"]}
+    "state": {
+      "enum": [
+        "reserved",
+        "duplicate",
+        "conflict",
+        "fake_attempted",
+        "outcome_unknown",
+        "denied",
+        "confirmed",
+        "failed"
+      ]
+    },
+    "readiness": {
+      "enum": [
+        "ready",
+        "degraded"
+      ]
+    },
+    "action_id": {
+      "$ref": "common.json#/$defs/opaque_id"
+    },
+    "request_id": {
+      "$ref": "common.json#/$defs/opaque_id"
+    },
+    "trace_id": {
+      "$ref": "common.json#/$defs/opaque_id"
+    },
+    "manifest_revision": {
+      "const": "home_assistant.harmless_light.v1"
+    },
+    "capability_id": {
+      "const": "home_assistant.harmless_light"
+    },
+    "existing_state": {
+      "enum": [
+        "reserved",
+        "fake_attempted",
+        "outcome_unknown",
+        "confirmed",
+        "denied",
+        "failed"
+      ]
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reason",
+        "evidence",
+        "power_state",
+        "observed_at"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "confirmed",
+            "denied",
+            "failed",
+            "outcome_unknown"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "observation_confirmed",
+            "prerequisite_unmet",
+            "adapter_rejected",
+            "service_rejected",
+            "no_effect_failure",
+            "transport_unknown",
+            "deadline",
+            "observation_missing",
+            "observation_stale",
+            "observation_mismatch"
+          ]
+        },
+        "evidence": {
+          "enum": [
+            "none",
+            "accepted",
+            "observed"
+          ]
+        },
+        "power_state": {
+          "enum": [
+            null,
+            "on",
+            "off"
+          ]
+        },
+        "observed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "maxLength": 20
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "confirmed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "observation_confirmed"
+                ]
+              },
+              "evidence": {
+                "const": "observed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "denied"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "prerequisite_unmet",
+                  "adapter_rejected",
+                  "service_rejected"
+                ]
+              },
+              "evidence": {
+                "const": "none"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "no_effect_failure"
+                ]
+              },
+              "evidence": {
+                "const": "none"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "outcome_unknown"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "transport_unknown",
+                  "deadline",
+                  "observation_missing",
+                  "observation_stale",
+                  "observation_mismatch"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "evidence": {
+                "const": "observed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "power_state": {
+                "enum": [
+                  "on",
+                  "off"
+                ]
+              },
+              "observed_at": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "power_state": {
+                "type": "null"
+              },
+              "observed_at": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    }
   },
   "allOf": [
-    {"if": {"properties": {"state": {"const": "denied"}}}, "then": {"not": {"anyOf": [{"required": ["action_id"]}, {"required": ["request_id"]}, {"required": ["trace_id"]}]}}},
-    {"if": {"properties": {"state": {"enum": ["reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown"]}}}, "then": {"required": ["action_id", "request_id", "trace_id", "manifest_revision", "capability_id"]}},
-    {"if": {"properties": {"state": {"enum": ["duplicate", "conflict"]}}}, "then": {"required": ["existing_state"]}, "else": {"not": {"required": ["existing_state"]}}}
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "denied"
+          }
+        }
+      },
+      "then": {
+        "oneOf": [
+          {
+            "required": [
+              "action_id",
+              "request_id",
+              "trace_id",
+              "manifest_revision",
+              "capability_id"
+            ]
+          },
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "action_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "request_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "trace_id"
+                  ]
+                },
+                {
+                  "required": [
+                    "manifest_revision"
+                  ]
+                },
+                {
+                  "required": [
+                    "capability_id"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "reserved",
+              "duplicate",
+              "conflict",
+              "fake_attempted",
+              "outcome_unknown",
+              "confirmed",
+              "failed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "action_id",
+          "request_id",
+          "trace_id",
+          "manifest_revision",
+          "capability_id"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "existing_state"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "existing_state"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "confirmed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "confirmed"
+              }
+            }
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "denied"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "denied"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "failed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "outcome_unknown"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "outcome_unknown"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "reserved",
+              "fake_attempted"
+            ]
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "result"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "reserved"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "result"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "fake_attempted"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "result"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "confirmed"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "confirmed"
+              }
+            }
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "denied"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "denied"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          }
+        },
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "duplicate",
+              "conflict"
+            ]
+          },
+          "existing_state": {
+            "const": "outcome_unknown"
+          }
+        },
+        "required": [
+          "existing_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "outcome_unknown"
+              }
+            }
+          }
+        }
+      }
+    }
   ]
 }

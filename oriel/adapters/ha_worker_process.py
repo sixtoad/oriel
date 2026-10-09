@@ -1,4 +1,4 @@
-"""Separately started availability worker that alone receives HA connection material."""
+"""Separately started bounded worker that alone receives HA connection material."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,12 @@ from pathlib import Path
 import signal
 import socket
 
-from .ha_worker import DEFAULT_TIMEOUT_SECONDS, HaWorkerChannelError, receive_request, ready_response, require_private_channel_parent, unavailable_response
+from .ha_worker import DEFAULT_TIMEOUT_SECONDS, HaWorkerChannelError, _remaining, receive_worker_request, execution_response, ready_response, require_private_channel_parent, unavailable_response
+
+
+from .ha_execution import HarmlessHaExecutor
+from ..application.ports import ActionExecutionRequest
+from ..domain.ha_manifest import CanonicalProposal, OPERATION_ID, TARGET_ALIAS, MANIFEST_REVISION
 
 
 CONNECTION_INPUT_ENV = "ORIEL_HA_WORKER_CONNECTION_REF"
@@ -61,12 +66,24 @@ def _bind_private(listener: socket.socket, channel: Path) -> None:
         os.umask(previous_umask)
 
 
-def _respond(connection: socket.socket, input_present: bool) -> None:
+def _respond(connection: socket.socket, input_present: bool, executor: HarmlessHaExecutor | None = None) -> None:
+    executing = False
     try:
         connection.settimeout(DEFAULT_TIMEOUT_SECONDS)
-        receive_request(connection)
-        connection.sendall(ready_response() if input_present else unavailable_response())
+        request = receive_worker_request(connection)
+        if request["type"] == "availability":
+            connection.sendall(ready_response() if input_present else unavailable_response())
+        else:
+            executing = True
+            deadline = float(request["deadline"])
+            proposal = CanonicalProposal(OPERATION_ID, TARGET_ALIAS, (("desired_state", request["desired_state"]),), MANIFEST_REVISION)
+            result = (executor or HarmlessHaExecutor()).execute(ActionExecutionRequest(proposal, deadline))
+            response = execution_response(result)
+            connection.settimeout(_remaining(deadline))
+            connection.sendall(response)
     except (HaWorkerChannelError, OSError, TimeoutError):
+        if executing:
+            return
         try:
             connection.sendall(unavailable_response())
         except OSError:

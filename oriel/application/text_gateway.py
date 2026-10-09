@@ -10,10 +10,10 @@ from types import MappingProxyType
 
 from .fast_router import FastRoute, route as select_fast_route
 from .action_recovery import recover_actions_and_requests
-from .ports import ActionPolicyPort, ActionLedgerPort, ActionLedgerUnavailable, ActionRecord, BackgroundTaskPort, BoundedHomeFact, HomeFactReaderPort, CancellationSignal, Clock, DryRunPreview, DryRunPreviewPort, FakeActionDispatchPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .ports import ActionExecutionPort, ActionExecutionRequest, ActionExecutionResult, ActionPolicyPort, ActionLedgerPort, ActionLedgerUnavailable, ActionRecord, BackgroundTaskPort, BoundedHomeFact, HomeFactReaderPort, CancellationSignal, Clock, DryRunPreview, DryRunPreviewPort, FakeActionDispatchPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
-from ..domain.ha_manifest import BUILT_IN_MANIFEST, CAPABILITY_ID, BuiltInManifest, CanonicalProposal, is_ha_fact_candidate, validate_ha_fact_request, is_ha_shaped_candidate, preview_eligibility, compute_effective_policy
+from ..domain.ha_manifest import BUILT_IN_MANIFEST, CAPABILITY_ID, BuiltInManifest, CanonicalProposal, is_ha_fact_candidate, validate_ha_fact_request, is_ha_shaped_candidate, preview_eligibility, execution_eligibility, compute_effective_policy
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
@@ -136,7 +136,7 @@ class _Request:
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, ha_manifest: BuiltInManifest = BUILT_IN_MANIFEST, ha_preview: DryRunPreviewPort | None = None, action_ledger: ActionLedgerPort | None = None, fake_action_dispatch: FakeActionDispatchPort | None = None, fact_reader: HomeFactReaderPort | None = None, configuration: ActionPolicyPort | None = None) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, ha_manifest: BuiltInManifest = BUILT_IN_MANIFEST, ha_preview: DryRunPreviewPort | None = None, action_ledger: ActionLedgerPort | None = None, fake_action_dispatch: FakeActionDispatchPort | None = None, fact_reader: HomeFactReaderPort | None = None, configuration: ActionPolicyPort | None = None, ha_execution: ActionExecutionPort | None = None) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -158,6 +158,7 @@ class TextGateway:
         self._ha_preview = ha_preview
         self._action_ledger = action_ledger
         self._fake_action_dispatch = fake_action_dispatch
+        self._ha_execution = ha_execution
         if configuration is not None and not configuration.synchronized_by(synchronization):
             raise ValueError("configuration and lifecycle must share synchronization")
         self._configuration = configuration
@@ -351,7 +352,7 @@ class TextGateway:
                 if self._is_fenced_locked(request) and not (
                     request.committed_action is not None
                     and state.get("action_id") == request.committed_action.action_id
-                    and state.get("state") in {"reserved", "fake_attempted", "outcome_unknown"}
+                    and state.get("state") in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}
                 ):
                     return False
             if event.type in {"ack", "content_delta", "proposal", "fact", "validation"}:
@@ -620,6 +621,18 @@ class TextGateway:
             yield self._error(request, decision.error_code or "fast_route_denied", decision.error_category or "policy_denial", decision.error_message or "This request is not allowed.", False)
             yield self._terminal(request, "denied")
             return
+        if decision.route == "execution":
+            admitted = self._admit_proposal(request, decision.proposal or {})
+            if admitted is None:
+                yield self._action_state_event(request, {"state": "denied", "readiness": "ready", "result": ActionExecutionResult("denied", "prerequisite_unmet").payload()})
+                yield self._terminal(request, "denied")
+                return
+            proposal_event, canonical = admitted
+            yield proposal_event
+            events, outcome = self._reserve_fake_action(request, canonical, execute=True)
+            yield from events
+            yield self._terminal(request, outcome or "completed")
+            return
         if decision.route == "proposal":
             admitted = self._admit_proposal(request, decision.proposal or {})
             if admitted is None:
@@ -704,7 +717,7 @@ class TextGateway:
         if request.cancellation.is_cancelled() or request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
             outcome = "cancelled"
         try:
-            if request.committed_action is not None and request.committed_action.state != "fake_attempted":
+            if request.committed_action is not None and request.committed_action.state in {"reserved", "outcome_unknown"}:
                 outcome = "outcome_unknown"
             outcome = self._ledger.mark_terminal(request.request_id, outcome) or outcome
         except RequestLedgerUnavailable:
@@ -816,10 +829,10 @@ class TextGateway:
             return event, None, True
         return event, "denied" if result.status == "denied" else "failed", False
 
-    def _reserve_fake_action(self, request: _Request, proposal: CanonicalProposal) -> tuple[tuple[StreamEvent, ...], str | None]:
+    def _reserve_fake_action(self, request: _Request, proposal: CanonicalProposal, *, execute: bool = False) -> tuple[tuple[StreamEvent, ...], str | None]:
         """Commit reservation and required audit under the lifecycle/policy lock."""
-        if self._action_ledger is None or self._fake_action_dispatch is None:
-            return (), None
+        if self._action_ledger is None or (self._ha_execution is None if execute else self._fake_action_dispatch is None):
+            return (), "denied" if execute else None
         with self._synchronization.locked():
             self._expire_sessions_locked()
             if self._is_fenced_locked(request):
@@ -828,11 +841,12 @@ class TextGateway:
                 return (), "failed"
             revision, restrictions, manifest = self._policy_locked()
             candidate = {"operation": proposal.operation, "target": proposal.target, "arguments": proposal.argument_object()}
-            eligibility = preview_eligibility(candidate, restrictions, manifest)
+            eligibility = (execution_eligibility if execute else preview_eligibility)(candidate, restrictions, manifest)
             if request.validated_policy_revision != revision or eligibility.material != proposal:
-                return (), "denied"
+                return (self._action_state_event(request, {"state": "denied", "readiness": "ready", "result": ActionExecutionResult("denied", "prerequisite_unmet").payload()}),), "denied"
             if self._recovery_failed or self._action_ledger.readiness().state != "ready":
                 return (self._action_state_event(request, {"state": "denied", "readiness": "degraded"}),), "denied"
+            execution_deadline = min(self._monotonic() + 5, request.deadline_at)
             session_expires_at = self._sessions[request.session_id].created_at + MAX_SESSION_SECONDS
             record = _new_action_record(request, proposal, self._clock.now())
             try:
@@ -845,11 +859,31 @@ class TextGateway:
             if reservation.status == "conflict":
                 return (reservation_event,), "denied"
             if reservation.status == "duplicate":
-                return (reservation_event,), "outcome_unknown" if reservation.record.state != "fake_attempted" else None
-            if self._deadline_expired_locked(request) or self._monotonic() >= session_expires_at:
+                return (reservation_event,), ({"confirmed": "completed", "denied": "denied", "failed": "failed", "fake_attempted": None}.get(reservation.record.state, "outcome_unknown"))
+            if self._deadline_expired_locked(request) or self._monotonic() >= session_expires_at or (execute and self._monotonic() >= execution_deadline):
                 self._expire_sessions_locked()
                 result = self._unknown_committed_locked(request, reservation.record)
                 return (reservation_event, result), "outcome_unknown"
+        if execute:
+            try:
+                result = self._ha_execution.execute(ActionExecutionRequest(proposal, execution_deadline))
+                if type(result) is not ActionExecutionResult:
+                    result = ActionExecutionResult("outcome_unknown", "transport_unknown")
+                elif self._monotonic() >= execution_deadline:
+                    result = ActionExecutionResult("outcome_unknown", "deadline", result.evidence, result.power_state, result.observed_at)
+                elif result.status == "confirmed" and result.power_state != proposal.argument_object()["desired_state"]:
+                    result = ActionExecutionResult("outcome_unknown", "observation_mismatch")
+            except Exception:
+                result = ActionExecutionResult("outcome_unknown", "transport_unknown")
+            with self._synchronization.locked():
+                try:
+                    observed = self._action_ledger.mark_execution_result(reservation.record.action_id, self._clock.now(), result)
+                except Exception:
+                    unknown_event = self._unknown_committed_locked(request, reservation.record, degrade=True)
+                    return (reservation_event, unknown_event), "outcome_unknown"
+                request.committed_action = observed
+                event = self._action_state_event(request, _action_state_payload(observed.state, observed, self._action_ledger.readiness().state))
+                return (reservation_event, event), {"confirmed": "completed", "denied": "denied", "failed": "failed"}.get(observed.state, "outcome_unknown")
         # Never hold lifecycle locks over fake I/O. Persist results/readiness under the lock.
         failed = False
         try:
@@ -1235,6 +1269,8 @@ def _action_state_payload(state: str, record: ActionRecord, readiness: str) -> d
         "capability_id": record.capability_id,
         "readiness": readiness,
     }
+    if record.result is not None:
+        payload["result"] = record.result.payload()
     if state in {"duplicate", "conflict"}:
         payload["existing_state"] = record.state
     return payload

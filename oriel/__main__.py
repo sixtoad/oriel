@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from http.client import HTTPConnection
 from typing import Callable, Mapping
@@ -138,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         if action_ledger is None:
             raise ActionLedgerUnavailable()
         ledger = owned_ledger = SQLiteRequestLedger(args.ledger)
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration, ha_execution=None if select_ha_worker_channel(os.environ) is None else UnixHaWorkerClient(select_ha_worker_channel(os.environ)))
         gateway.recover_interrupted_requests()
     except (RequestLedgerUnavailable, ActionLedgerUnavailable):
         if action_ledger is not None:
@@ -146,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         if owned_ledger is not None:
             owned_ledger.close()
         ledger = UnavailableRequestLedger()
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration, ha_execution=None if select_ha_worker_channel(os.environ) is None else UnixHaWorkerClient(select_ha_worker_channel(os.environ)))
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()

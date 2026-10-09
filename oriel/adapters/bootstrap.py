@@ -293,10 +293,24 @@ class InMemoryActionLedger:
         self.audit.append((record.action_id, "reserved", record.reserved_at))
         return ActionReservation("reserved", record)
 
+    def mark_execution_result(self, action_id, occurred_at, result):
+        from dataclasses import replace
+        existing = next((record for record in self.records.values() if record.action_id == action_id), None)
+        if existing is not None and existing.state != "reserved":
+            return existing
+        updated = self._transition(action_id, occurred_at, result.status)
+        if updated.state == result.status:
+            updated = replace(updated, result=result)
+            self.records[updated.request_id] = updated
+        return updated
+
     def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord:
         return self._transition(action_id, occurred_at, "fake_attempted")
 
     def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord:
+        existing = next((record for record in self.records.values() if record.action_id == action_id), None)
+        if existing is not None and existing.state in {"confirmed", "denied", "failed"}:
+            return existing
         return self._transition(action_id, occurred_at, "outcome_unknown")
 
     def recover_unresolved(self, occurred_at: str) -> None:

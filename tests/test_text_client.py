@@ -279,3 +279,42 @@ class TextClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActionRenderingTests(unittest.TestCase):
+    def test_execution_words_are_deterministic_and_acceptance_never_claims_success(self):
+        from oriel.application.ports import ActionExecutionResult
+        output = io.StringIO()
+        # Rendering is independent of HTTP; a minimal reference-client instance suffices.
+        client = object.__new__(text_client.TextClient)
+        client._stdout = output
+        client._content_open = False
+        for result in (
+            ActionExecutionResult("confirmed", "observation_confirmed", "observed", "on", "2026-10-09T00:00:00Z"),
+            ActionExecutionResult("outcome_unknown", "observation_missing", "accepted"),
+            ActionExecutionResult("denied", "service_rejected"),
+            ActionExecutionResult("failed", "no_effect_failure"),
+        ):
+            client._render_event("action_state", {"action_state": {"state": result.status, "result": result.payload()}})
+        lines = output.getvalue().splitlines()
+        self.assertIn("confirmed by fresh observation", lines[0])
+        self.assertIn("completion unproven; no retry", lines[1])
+        self.assertEqual(lines[2:], ["action: denied", "action: failed without effect"])
+
+    def test_malformed_action_state_and_unproven_failure_do_not_claim_no_effect(self):
+        valid = {"status": "failed", "reason": "no_effect_failure", "evidence": "none", "power_state": None, "observed_at": None}
+        actions = [{"state": value} for value in ([], {}, None)]
+        actions += [{"state": "failed", "result": value} for value in (None, [], {}, "PRIVATE_CANARY")]
+        for key, value in (("status", "confirmed"), ("reason", "transport_unknown"), ("evidence", "accepted"), ("power_state", "on"), ("observed_at", "2026-10-09T00:00:00Z")):
+            actions.append({"state": "failed", "result": {**valid, key: value}})
+        for key in valid:
+            actions.append({"state": "failed", "result": {name: value for name, value in valid.items() if name != key}})
+        for action in actions:
+            with self.subTest(action=action):
+                output = io.StringIO()
+                client = object.__new__(text_client.TextClient)
+                client._stdout, client._content_open = output, False
+                client._render_event("action_state", {"action_state": action})
+                self.assertIn(output.getvalue().strip(), {"action: malformed event", "action: completion unproven"})
+                self.assertNotIn("without effect", output.getvalue())
+                self.assertNotIn("PRIVATE_CANARY", output.getvalue())
