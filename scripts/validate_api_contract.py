@@ -27,10 +27,10 @@ FIXTURES = {
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
               "home-fact-stream": "home_fact_stream",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
-              "action-reservation": "action_reservation", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
+              "action-reservation": "action_reservation", "cancelled-action-known": "cancelled_action_known", "cancelled-action-unknown": "cancelled_action_unknown", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
                 "cancellation-outcome": "cancellation_outcome", "out-of-order-sequence": "invalid_sequence", "passive-status-outcome": "passive_status_outcome", "post-terminal": "post_terminal",
-                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview", "invalid-action-state": "invalid_action_state"},
+                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview", "invalid-action-state": "invalid_action_state", "cancelled-action-hidden": "cancelled_action_hidden", "cancelled-action-content": "cancelled_action_content", "cancelled-action-repeat": "cancelled_action_repeat"},
 }
 FIXTURE_NAMES = frozenset(name for group in FIXTURES.values() for name in group.values())
 
@@ -138,15 +138,25 @@ def _error(value, path, errors):
         errors.append(path + ".error.action_outcome: invalid action outcome")
 
 
-def validate_stream(events, path="events"):
+def validate_stream(events, path="events", cancellation_after_seq=None):
     errors = []
     if type(events) is not list or not events:
         return [f"{path}: expected nonempty event array"]
+    if cancellation_after_seq is not None and (type(cancellation_after_seq) is not int or cancellation_after_seq < 1):
+        return [f"{path}: invalid cancellation acknowledgement boundary"]
+    if cancellation_after_seq is not None:
+        boundary = next((event for event in events if isinstance(event, dict) and event.get("seq") == cancellation_after_seq), None)
+        terminal_sequences = [event.get("seq") for event in events if isinstance(event, dict) and event.get("type") == "terminal" and type(event.get("seq")) is int]
+        if boundary is None or boundary.get("type") == "terminal" or not terminal_sequences or cancellation_after_seq >= min(terminal_sequences):
+            errors.append(path + ": cancellation boundary must identify an event before terminal")
+    late_cancellation_errors = 0
     request = session = trace = generation = None
     seq = 0
     acked = useful = terminal = False
     streamed_content_bytes = 0
     preview_proposal = None
+    action_id = action_state = None
+    action_evidence_count = 0
     for index, event in enumerate(events):
         loc = f"{path}[{index}]"
         if not _keys(event, ("api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"), loc, errors, allow_extra=True):
@@ -172,6 +182,18 @@ def validate_stream(events, path="events"):
             request, session, trace, generation = (event["request_id"], event["session_id"], event["trace_id"], event["context_generation"])
         elif (event["request_id"], event["session_id"], event["trace_id"], event["context_generation"]) != (request, session, trace, generation):
             errors.append(loc + ": event identity or context generation changed")
+        if cancellation_after_seq is not None and type(event["seq"]) is int and event["seq"] > cancellation_after_seq:
+            if kind == "error":
+                late_cancellation_errors += 1
+                error = event.get("error")
+                if late_cancellation_errors > 1 or not isinstance(error, dict) or error.get("category") != "cancellation":
+                    errors.append(loc + ": at most one typed cancellation error may follow acknowledgement")
+                elif any(error.get(key) != event[key] for key in ("request_id", "session_id", "trace_id")):
+                    errors.append(loc + ": cancellation error must match stream identity")
+            if kind in {"ack", "content_delta", "proposal", "fact", "validation"}:
+                errors.append(loc + ": generated output after cancellation acknowledgement")
+            if kind == "action_state" and (not isinstance(event.get("action_state"), dict) or event["action_state"].get("state") not in {"reserved", "fake_attempted", "outcome_unknown"}):
+                errors.append(loc + ": only committed action evidence survives cancellation")
         if kind == "ack":
             if acked:
                 errors.append(loc + ".type: ack may occur at most once")
@@ -228,6 +250,18 @@ def validate_stream(events, path="events"):
                         errors.append(loc + "." + key + ": action_state may not carry other payload")
                 state = event["action_state"]
                 if type(state) is dict and state.get("state") != "denied":
+                    action_evidence_count += 1
+                    if action_evidence_count > 2:
+                        errors.append(loc + ": action evidence exceeds bounded commitment/result pair")
+                    if action_id is not None and state.get("action_id") != action_id:
+                        errors.append(loc + ": action identity changed")
+                    next_state = state.get("state")
+                    if action_state is None and next_state in {"fake_attempted", "outcome_unknown"}:
+                        errors.append(loc + ": action result requires prior reservation")
+                    if action_state is not None and (action_state != "reserved" or next_state not in {"fake_attempted", "outcome_unknown"}):
+                        errors.append(loc + ": action evidence regressed or repeated")
+                    action_id = state.get("action_id")
+                    action_state = state.get("existing_state") if next_state in {"duplicate", "conflict"} else next_state
                     for key in ("request_id", "trace_id"):
                         if state.get(key) != event[key]:
                             errors.append(loc + ".action_state." + key + ": must match stream identity")
@@ -242,6 +276,8 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".outcome: terminal requires outcome")
             if event.get("outcome") not in OUTCOMES:
                 errors.append(loc + ".outcome: invalid terminal outcome")
+            if action_state in {"reserved", "outcome_unknown"} and event.get("outcome") != "outcome_unknown":
+                errors.append(loc + ": unresolved commitment requires outcome_unknown")
             terminal = True
         event_bytes = len(json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
         if event_bytes > LIMITS["event_data_bytes"]:
@@ -474,7 +510,16 @@ def validate_fixture(document):
     fixture = document["fixture"]
     if fixture not in FIXTURE_NAMES:
         errors.append("fixture: unknown fixture name")
-    if "events" in document: errors.extend(validate_stream(document["events"]))
+    combined_cancellation = fixture.startswith("cancelled_action_") or ("events" in document and ("acknowledgements" in document or "cancellation_after_seq" in document))
+    if combined_cancellation:
+        if document.get("cancellation_after_seq") is None:
+            errors.append("cancellation_after_seq: combined fixture requires cancellation boundary")
+        events = document.get("events")
+        request_id = events[0].get("request_id") if isinstance(events, list) and events and isinstance(events[0], dict) else None
+        acknowledgements = document.get("acknowledgements")
+        if not isinstance(acknowledgements, list) or len(acknowledgements) != 1 or not isinstance(acknowledgements[0], dict) or acknowledgements[0].get("state") != "cancellation_requested" or acknowledgements[0].get("request_id") != request_id:
+            errors.append("acknowledgements: combined fixture requires matching live cancellation acknowledgement")
+    if "events" in document: errors.extend(validate_stream(document["events"], cancellation_after_seq=document.get("cancellation_after_seq")))
     if fixture == "accepted_error_categories":
         streams = document.get("streams")
         if type(streams) is not list or len(streams) != 5:
@@ -497,7 +542,7 @@ def validate_fixture(document):
         if type(statuses) is not list or not statuses: errors.append("statuses: expected nonempty array")
         else:
             for index, status in enumerate(statuses): _validate_status(status, f"statuses[{index}]", errors)
-    if fixture in ("cancellation_race", "cancellation_outcome"):
+    if fixture in ("cancellation_race", "cancellation_outcome", "cancelled_action_known", "cancelled_action_unknown", "cancelled_action_hidden", "cancelled_action_content", "cancelled_action_repeat"):
         acknowledgements = document.get("acknowledgements")
         if type(acknowledgements) is not list or not acknowledgements: errors.append("acknowledgements: expected nonempty array")
         else:

@@ -224,12 +224,16 @@ class InMemoryRequestLedger:
     def reserve(self, record: RequestStatusRecord) -> None:
         self.records[record.request_id] = record
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None:
+    def mark_terminal(self, request_id: str, outcome: str) -> str:
         record = self.records[request_id]
+        if record.state == "terminal":
+            return record.outcome
         self.records[request_id] = RequestStatusRecord(
             record.request_id, record.session_id, record.trace_id, record.context_generation,
             "terminal", outcome, record.admitted_at, record.expires_at,
         )
+
+        return outcome
 
     def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None:
         record = self.records.get(request_id)
@@ -238,9 +242,11 @@ class InMemoryRequestLedger:
             return None
         return record
 
-    def recover_interrupted(self) -> None:
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None:
         for request_id, record in tuple(self.records.items()):
-            if record.state == "in_progress":
+            if request_id in committed_request_ids and record.state == "in_progress":
+                self.records[request_id] = RequestStatusRecord(record.request_id, record.session_id, record.trace_id, record.context_generation, "terminal", "outcome_unknown", record.admitted_at, record.expires_at)
+            elif record.state == "in_progress":
                 self.mark_terminal(request_id, "failed")
 
 
@@ -251,7 +257,7 @@ class UnavailableRequestLedger:
         del record
         raise RequestLedgerUnavailable()
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None:
+    def mark_terminal(self, request_id: str, outcome: str) -> str:
         del request_id, outcome
         raise RequestLedgerUnavailable()
 
@@ -259,7 +265,7 @@ class UnavailableRequestLedger:
         del request_id, now
         raise RequestLedgerUnavailable()
 
-    def recover_interrupted(self) -> None:
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None:
         raise RequestLedgerUnavailable()
 
 
@@ -280,6 +286,9 @@ class InMemoryActionLedger:
         existing = self.records.get(record.request_id)
         if existing is not None:
             return ActionReservation("duplicate" if existing.operation_fingerprint == record.operation_fingerprint else "conflict", existing)
+        if self._degraded:
+            from ..application.ports import ActionLedgerUnavailable
+            raise ActionLedgerUnavailable()
         self.records[record.request_id] = record
         self.audit.append((record.action_id, "reserved", record.reserved_at))
         return ActionReservation("reserved", record)
@@ -289,6 +298,14 @@ class InMemoryActionLedger:
 
     def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord:
         return self._transition(action_id, occurred_at, "outcome_unknown")
+
+    def recover_unresolved(self, occurred_at: str) -> None:
+        for record in tuple(self.records.values()):
+            if record.state == "reserved":
+                self.mark_outcome_unknown(record.action_id, occurred_at)
+
+    def committed_request_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(record.request_id for record in self.records.values()))
 
     def readiness(self) -> ActionReadiness:
         return ActionReadiness("degraded" if self._degraded else "ready")
@@ -303,6 +320,10 @@ class InMemoryActionLedger:
             raise ActionLedgerUnavailable()
         for request_id, record in self.records.items():
             if record.action_id == action_id:
+                if record.state in {state, "outcome_unknown"}:
+                    return record
+                if state == "fake_attempted" and record.state != "reserved":
+                    raise ActionLedgerUnavailable()
                 updated = ActionRecord(
                     record.action_id, record.request_id, record.trace_id,
                     record.manifest_revision, record.capability_id,

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ..domain.configuration import API_VERSION, ConfigError, CoreConfig, parse_core_config
-from .ports import SynchronizationPort
+from .ports import ActionPolicyConfiguration, SynchronizationPort
+from types import MappingProxyType
 
 
 INVALID_CONFIGURATION_CODE = "invalid_configuration"
@@ -77,6 +78,18 @@ class ConfigurationService:
     def __init__(self, synchronization: SynchronizationPort) -> None:
         self._synchronization = synchronization
         self._active: ActiveConfiguration | None = None
+
+    def synchronized_by(self, synchronization: SynchronizationPort) -> bool:
+        return self._synchronization is synchronization
+
+    def action_policy(self) -> ActionPolicyConfiguration:
+        with self._synchronization.locked():
+            active = self._active
+            if active is None:
+                return ActionPolicyConfiguration(0, None, True)
+            skill = active.config.skills.get("home_assistant", {})
+            restrictions = MappingProxyType({key: tuple(skill[key]) for key in ("targets", "read_fields") if key in skill})
+            return ActionPolicyConfiguration(active.revision, restrictions, "home_assistant" in active.config.disabled_skills)
 
     @property
     def active(self) -> ActiveConfiguration | None:

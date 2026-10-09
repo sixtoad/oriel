@@ -1293,11 +1293,20 @@ class StreamingHttpTests(unittest.TestCase):
         self.assertEqual((terminal["state"], terminal["outcome"]), ("terminal", "cancelled"))
 
     def test_cancel_route_acknowledges_live_terminal_and_unknown_requests(self):
-        server = self.with_server(FakeModel(chunks=("one", "two"), delay_seconds=0.2))
+        entered, release = Event(), Event()
+        class GatedModel(FakeModel):
+            def stream(self, input, cancellation):
+                entered.set()
+                if not release.wait(3):
+                    raise AssertionError("provider test gate timed out")
+                yield ModelOutcome("completed")
+        self.addCleanup(release.set)
+        server = self.with_server(GatedModel())
         session = self.create_session(server)
         stream_connection, stream = self.start_turn(server, str(session["session_id"]))
         try:
             accepted = self.read_frame(stream)[1]
+            self.assertTrue(entered.wait(2))
             cancel_connection, cancellation = self.cancel(server, str(accepted["request_id"]))
             try:
                 self.assertEqual(cancellation.status, 202)
@@ -1310,6 +1319,7 @@ class StreamingHttpTests(unittest.TestCase):
                 self.assertEqual(json.loads(repeated.read()), {"request_id": accepted["request_id"], "state": "cancellation_requested"})
             finally:
                 repeat_connection.close()
+            release.set()
             kind, terminal = self.read_frame(stream)
             self.assertEqual(kind, "terminal")
             self.assertEqual(terminal["outcome"], "cancelled")
@@ -1381,6 +1391,28 @@ class StreamingHttpTests(unittest.TestCase):
             self.assertEqual(json.loads(unavailable.read())["error"]["category"], "conflict_or_expired_reference")
         finally:
             connection.close()
+
+
+class CommittedActionDeliveryTests(unittest.TestCase):
+    def test_cancel_ack_suppresses_proposal_but_allows_only_same_action_evidence(self):
+        from dataclasses import replace
+        from tests.test_action_fences import gateway, STARTUP
+        core = gateway()
+        stream = iter(core.begin_turn(core.create_session().session_id, {"input": "Explain this."}, STARTUP))
+        accepted, proposal, validation = next(stream), next(stream), next(stream)
+        reserved = next(stream)
+        self.assertEqual(core.cancel_request(accepted.request_id)["state"], "cancellation_requested")
+        delivered = []
+        self.assertFalse(core.deliver_stream_event(proposal, delivered.append))
+        self.assertFalse(core.deliver_stream_event(validation, delivered.append))
+        spoofed = replace(reserved, action_state={**reserved.action_state, "action_id": "other-action"})
+        self.assertFalse(core.deliver_stream_event(spoofed, delivered.append))
+        self.assertTrue(core.deliver_stream_event(reserved, delivered.append))
+        result = next(stream)
+        self.assertTrue(core.deliver_stream_event(result, delivered.append))
+        terminal = next(stream)
+        self.assertEqual(terminal.outcome, "cancelled")
+        self.assertEqual([event.action_state["state"] for event in delivered], ["reserved", "fake_attempted"])
 
 
 if __name__ == "__main__":

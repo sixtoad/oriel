@@ -39,9 +39,10 @@ def _compose_startup(
     environ: Mapping[str, str] | None = None,
     model_probe: Callable[[object], bool] | None = None,
     optional_ha_probe: Callable[[], bool] | None = None,
+    configuration: ConfigurationService | None = None,
 ):
     """Select the one local profile resolver and activate configuration once."""
-    configuration = ConfigurationService(ThreadSafeSynchronization())
+    configuration = configuration or ConfigurationService(ThreadSafeSynchronization())
     channel = select_ha_worker_channel(environ)
     try:
         resolver = provider_profile_resolver(environ)
@@ -124,20 +125,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         print(json.dumps(run_self_test(args.config), sort_keys=True, separators=(",", ":")))
         return 0
-    startup, _profile = _compose_startup(args.config)
+    synchronization = ThreadSafeSynchronization()
+    configuration = ConfigurationService(synchronization)
+    startup, _profile = _compose_startup(args.config, configuration=configuration)
     action_ledger = None
     try:
         action_ledger = SQLiteActionLedger(args.action_ledger)
-        action_ledger.recover_unresolved(RuntimeClock().now())
     except ActionLedgerUnavailable:
         action_ledger = None
+    owned_ledger = None
     try:
-        ledger = SQLiteRequestLedger(args.ledger)
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger)
+        if action_ledger is None:
+            raise ActionLedgerUnavailable()
+        ledger = owned_ledger = SQLiteRequestLedger(args.ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration)
         gateway.recover_interrupted_requests()
-    except RequestLedgerUnavailable:
+    except (RequestLedgerUnavailable, ActionLedgerUnavailable):
+        if action_ledger is not None:
+            action_ledger.degrade()
+        if owned_ledger is not None:
+            owned_ledger.close()
         ledger = UnavailableRequestLedger()
-        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), ThreadSafeSynchronization(), ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger)
+        gateway = TextGateway(_model_for_profile(_profile), RuntimeClock(), VolatileState(), NoopTelemetry(), DisabledTools(), SecureIds(), synchronization, ledger, scheduler=ThreadingScheduler(), tasks=ThreadingTasks(), ha_restrictions=_ha_restrictions(startup.config), fact_reader=synthetic_ha_fact_reader(startup.optional_ha_state), ha_preview=HarmlessHaDryRun(BUILT_IN_MANIFEST), action_ledger=action_ledger, configuration=configuration)
     server = HealthServer(startup, gateway, args.host, args.port)
     cleanup = CleanupTrigger(gateway.expire_sessions)
     cleanup.start()

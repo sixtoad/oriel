@@ -74,6 +74,9 @@ class SQLiteActionLedger:
                     existing_record = ActionRecord(*existing)
                     status = "duplicate" if existing_record.operation_fingerprint == record.operation_fingerprint else "conflict"
                     return ActionReservation(status, existing_record)
+                readiness = connection.execute("SELECT state FROM action_readiness WHERE singleton = 1").fetchone()
+                if self._degraded or readiness is None or readiness[0] != "ready":
+                    raise sqlite3.DatabaseError("action readiness degraded")
                 connection.execute(
                     "INSERT INTO action_ledger (action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -128,6 +131,14 @@ class SQLiteActionLedger:
             self.degrade()
             raise ActionLedgerUnavailable() from None
 
+    def committed_request_ids(self) -> tuple[str, ...]:
+        try:
+            with self._connect() as connection:
+                return tuple(row[0] for row in connection.execute("SELECT request_id FROM action_ledger ORDER BY request_id"))
+        except (OSError, sqlite3.Error):
+            self.degrade()
+            raise ActionLedgerUnavailable() from None
+
     def audit_events(self, action_id: str) -> tuple[tuple[str, str], ...]:
         """Internal test seam; no application/API audit-query route exists."""
         try:
@@ -141,6 +152,9 @@ class SQLiteActionLedger:
             _canonical_utc(occurred_at)
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute("SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at FROM action_ledger WHERE action_id = ?", (action_id,)).fetchone()
+                if existing is not None and existing[6] in {state, "outcome_unknown"}:
+                    return ActionRecord(*existing)
                 expected = "reserved" if state == "fake_attempted" else "reserved', 'fake_attempted"
                 cursor = connection.execute(
                     f"UPDATE action_ledger SET state = ?, updated_at = ? WHERE action_id = ? AND state IN ('{expected}')",

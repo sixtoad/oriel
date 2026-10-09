@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oriel.invalid/api/1.0/schemas/event.json",
   "title": "Oriel 1.0 stream event",
+  "description": "After cancellation acknowledgement, a committed action may emit at most its reservation and one known fake-attempt or unknown result. No generated content or new proposal may follow. Unresolved commitment requires terminal outcome_unknown; fake_attempted never claims physical completion.",
   "type": "object",
   "additionalProperties": true,
   "required": ["api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"],

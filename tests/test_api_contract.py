@@ -16,6 +16,62 @@ from scripts.validate_api_contract import load_json, validate_directory, validat
 
 
 class ApiContractTests(unittest.TestCase):
+    def test_cancelled_action_evidence_preserves_uncertainty_and_bounds(self):
+        for filename in ("cancelled-action-known", "cancelled-action-unknown"):
+            self.assertEqual(validate_fixture(load_json(ROOT / "api" / "examples" / "valid" / (filename + ".json"))), [])
+        for filename, diagnostic in (("cancelled-action-hidden", "unresolved commitment"), ("cancelled-action-content", "after cancellation"), ("cancelled-action-repeat", "repeated")):
+            errors = validate_fixture(load_json(ROOT / "api" / "examples" / "invalid" / (filename + ".json")))
+            self.assertIn(diagnostic, " ".join(errors))
+
+    def test_combined_cancellation_fixture_requires_real_boundary_and_matching_ack(self):
+        original = load_json(EXAMPLES / "valid" / "cancelled-action-known.json")
+        mutations = (
+            lambda d: d.pop("cancellation_after_seq"),
+            lambda d: d.update(cancellation_after_seq=0),
+            lambda d: d.update(cancellation_after_seq=6),
+            lambda d: d.update(cancellation_after_seq=100),
+            lambda d: d["acknowledgements"][0].update(request_id="unrelated"),
+            lambda d: d["acknowledgements"][0].update(state="already_terminal", outcome="cancelled"),
+            lambda d: d.pop("acknowledgements"),
+        )
+        for mutate in mutations:
+            document = copy.deepcopy(original)
+            mutate(document)
+            self.assertTrue(validate_fixture(json.loads(json.dumps(document, sort_keys=True))))
+        document = copy.deepcopy(original)
+        document["events"].pop(3)
+        self.assertIn("before terminal", " ".join(validate_stream(document["events"], cancellation_after_seq=4)))
+
+    def test_action_results_require_reservation_but_duplicate_conflict_remain_valid(self):
+        original = load_json(EXAMPLES / "valid" / "action-reservation.json")["events"]
+        for state in ("fake_attempted", "outcome_unknown"):
+            events = copy.deepcopy(original)
+            events.pop(3)
+            events[-2]["action_state"]["state"] = state
+            events[-1]["outcome"] = "outcome_unknown"
+            self.assertIn("prior reservation", " ".join(validate_stream(events)))
+        for state in ("duplicate", "conflict"):
+            events = copy.deepcopy(original)
+            events.pop(4)
+            events[-2]["action_state"].update(state=state, existing_state="fake_attempted")
+            events[-1]["outcome"] = "denied" if state == "conflict" else "completed"
+            self.assertEqual(validate_stream(events), [])
+
+    def test_after_cancellation_only_one_matching_typed_error_is_valid(self):
+        original = load_json(EXAMPLES / "valid" / "cancelled-action-known.json")["events"]
+        error = {**original[-1], "type": "error", "error": {"code": "request_cancelled", "category": "cancellation", "message": "Request was cancelled.", "retryable": False, "request_id": "req-1", "session_id": "ses-1", "trace_id": "tr-1"}}
+        error.pop("outcome")
+        for change in ("valid", "repeated", "category", "identity"):
+            events = copy.deepcopy(original)
+            inserted = copy.deepcopy(error)
+            if change == "category": inserted["error"]["category"] = "internal_failure"
+            if change == "identity": inserted["error"]["request_id"] = "unrelated"
+            events.insert(-1, inserted)
+            if change == "repeated": events.insert(-1, copy.deepcopy(inserted))
+            for seq, event in enumerate(events, 1): event["seq"] = seq
+            errors = validate_stream(events, cancellation_after_seq=3)
+            self.assertEqual(bool(errors), change != "valid", errors)
+
     def test_malformed_action_state_reports_errors_without_crashing(self):
         for payload in (None, [], "reserved", 1):
             with self.subTest(payload=payload):
@@ -40,7 +96,7 @@ class ApiContractTests(unittest.TestCase):
     def test_fixture_matrix_is_validated_offline(self):
         result = self.cli(offline_guard=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "Valid API contract fixtures: 15 valid; 10 invalid.\n")
+        self.assertEqual(result.stdout, "Valid API contract fixtures: 17 valid; 13 invalid.\n")
         self.assertEqual(result.stderr, "")
 
     def test_every_matrix_fixture_has_its_expected_result(self):
