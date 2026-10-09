@@ -2,6 +2,8 @@
 """A small, dependency-free reference client for Oriel's public text API."""
 from __future__ import annotations
 
+from datetime import datetime
+
 import argparse
 from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 import ipaddress
@@ -276,6 +278,23 @@ class TextClient:
                 self._line("preview: " + status + (" " + " ".join(fields) if fields else ""))
             else:
                 self._line("preview: malformed event")
+        elif event_type == "action_state":
+            action = payload.get("action_state")
+            if not isinstance(action, Mapping):
+                self._line("action: malformed event")
+                return
+            state = action.get("state")
+            if not isinstance(state, str):
+                self._line("action: malformed event")
+                return
+            result = action.get("result")
+            if state == "confirmed" and isinstance(result, Mapping) and result.get("status") == "confirmed" and result.get("reason") == "observation_confirmed" and result.get("evidence") == "observed" and result.get("power_state") in ("on", "off") and _valid_observation_time(result.get("observed_at")):
+                self._line("action: confirmed by fresh observation; power=" + result["power_state"])
+            elif state == "failed" and isinstance(result, Mapping) and result.get("status") == "failed" and result.get("reason") == "no_effect_failure" and result.get("evidence") == "none" and "power_state" in result and result["power_state"] is None and "observed_at" in result and result["observed_at"] is None:
+                self._line("action: failed without effect")
+            else:
+                wording = {"reserved": "reserved", "fake_attempted": "simulated attempt; completion unproven", "outcome_unknown": "outcome unknown; completion unproven; no retry", "denied": "denied", "duplicate": "existing action; no retry", "conflict": "conflicting action; no dispatch"}
+                self._line("action: " + wording.get(state, "completion unproven"))
         elif event_type == "error":
             error = payload.get("error")
             if isinstance(error, Mapping):
@@ -287,6 +306,15 @@ class TextClient:
             self._line(f"terminal: outcome={self._display(payload['outcome'])}")
         else:
             self._line(f"event: type={self._display(event_type)}")
+
+
+def _valid_observation_time(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 20:
+        return False
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%dT%H:%M:%SZ") == value
+    except ValueError:
+        return False
 
 
 def build_parser() -> argparse.ArgumentParser:

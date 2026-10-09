@@ -24,6 +24,26 @@ _GENERIC_CONTROL_FIELDS = frozenset(("deadline", "dry_run", "idempotency"))
 
 
 @dataclass(frozen=True)
+class ExecutionPrerequisites:
+    """Reviewed evidence supplied only by trusted composition, never a request.
+
+    Fixture evidence enables injected fixtures only; shipping composition supplies none.
+    Live review must revalidate all four obligations against the current revision.
+    """
+    manifest_revision: str
+    scope: str
+    effect_reviewed: bool = False
+    restricted_call_path: bool = False
+    excluded_operation_denied: bool = False
+    confirmation_reviewed: bool = False
+
+    def permits(self, revision: str) -> bool:
+        return self.manifest_revision == revision and self.scope in {"controlled_fixture", "live"} and all(
+            value is True for value in (self.effect_reviewed, self.restricted_call_path,
+                                       self.excluded_operation_denied, self.confirmation_reviewed))
+
+
+@dataclass(frozen=True)
 class BuiltInManifest:
     revision: str = MANIFEST_REVISION
     operation: str = OPERATION_ID
@@ -35,6 +55,7 @@ class BuiltInManifest:
     g2: str = "incomplete"
     requires_observed_after_dispatch: bool = True
     completion_on_mismatch: str = "completion_unproven"
+    execution_prerequisites: ExecutionPrerequisites | None = None
 
 
 BUILT_IN_MANIFEST = BuiltInManifest()
@@ -214,3 +235,17 @@ def _members(value: object) -> frozenset[str] | None:
     if not isinstance(value, (list, tuple, frozenset)) or not all(isinstance(item, str) for item in value):
         return None
     return frozenset(value)
+
+
+def execution_eligibility(candidate: object, restrictions: Mapping[str, object] | None = None, manifest: BuiltInManifest = BUILT_IN_MANIFEST) -> ValidationResult:
+    result = preview_eligibility(candidate, restrictions, manifest)
+    if not result.permitted:
+        return result
+    evidence = manifest.execution_prerequisites
+    if (manifest.revision != MANIFEST_REVISION or manifest.operation != OPERATION_ID
+            or manifest.targets != frozenset((TARGET_ALIAS,))
+            or manifest.initial_deadline_seconds != INITIAL_DEADLINE_SECONDS
+            or not manifest.requires_observed_after_dispatch
+            or type(evidence) is not ExecutionPrerequisites or not evidence.permits(manifest.revision)):
+        return ValidationResult(policy=result.policy, denial_code="permission_prerequisite_unmet")
+    return result

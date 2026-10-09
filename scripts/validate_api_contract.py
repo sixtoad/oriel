@@ -27,7 +27,7 @@ FIXTURES = {
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
               "home-fact-stream": "home_fact_stream",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
-              "action-reservation": "action_reservation", "cancelled-action-known": "cancelled_action_known", "cancelled-action-unknown": "cancelled_action_unknown", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
+              "execution-confirmed": "execution_confirmed", "execution-unknown": "execution_unknown", "action-reservation": "action_reservation", "cancelled-action-known": "cancelled_action_known", "cancelled-action-unknown": "cancelled_action_unknown", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
                 "cancellation-outcome": "cancellation_outcome", "out-of-order-sequence": "invalid_sequence", "passive-status-outcome": "passive_status_outcome", "post-terminal": "post_terminal",
                 "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview", "invalid-action-state": "invalid_action_state", "cancelled-action-hidden": "cancelled_action_hidden", "cancelled-action-content": "cancelled_action_content", "cancelled-action-repeat": "cancelled_action_repeat"},
@@ -156,6 +156,7 @@ def validate_stream(events, path="events", cancellation_after_seq=None):
     streamed_content_bytes = 0
     preview_proposal = None
     action_id = action_state = None
+    action_conflict = False
     action_evidence_count = 0
     for index, event in enumerate(events):
         loc = f"{path}[{index}]"
@@ -192,7 +193,8 @@ def validate_stream(events, path="events", cancellation_after_seq=None):
                     errors.append(loc + ": cancellation error must match stream identity")
             if kind in {"ack", "content_delta", "proposal", "fact", "validation"}:
                 errors.append(loc + ": generated output after cancellation acknowledgement")
-            if kind == "action_state" and (not isinstance(event.get("action_state"), dict) or event["action_state"].get("state") not in {"reserved", "fake_attempted", "outcome_unknown"}):
+            if kind == "action_state" and (not isinstance(event.get("action_state"), dict) or event["action_state"].get("state") not in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}
+                    or not all(isinstance(event["action_state"].get(key), str) and event["action_state"][key] for key in ("action_id", "request_id", "trace_id"))):
                 errors.append(loc + ": only committed action evidence survives cancellation")
         if kind == "ack":
             if acked:
@@ -249,22 +251,25 @@ def validate_stream(events, path="events", cancellation_after_seq=None):
                     if key in event:
                         errors.append(loc + "." + key + ": action_state may not carry other payload")
                 state = event["action_state"]
-                if type(state) is dict and state.get("state") != "denied":
+                if type(state) is dict and (state.get("state") != "denied" or "action_id" in state):
                     action_evidence_count += 1
                     if action_evidence_count > 2:
                         errors.append(loc + ": action evidence exceeds bounded commitment/result pair")
                     if action_id is not None and state.get("action_id") != action_id:
                         errors.append(loc + ": action identity changed")
                     next_state = state.get("state")
-                    if action_state is None and next_state in {"fake_attempted", "outcome_unknown"}:
+                    if action_state is None and next_state in {"fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}:
                         errors.append(loc + ": action result requires prior reservation")
-                    if action_state is not None and (action_state != "reserved" or next_state not in {"fake_attempted", "outcome_unknown"}):
+                    if action_state is not None and (action_state != "reserved" or next_state not in {"fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}):
                         errors.append(loc + ": action evidence regressed or repeated")
                     action_id = state.get("action_id")
                     action_state = state.get("existing_state") if next_state in {"duplicate", "conflict"} else next_state
+                    action_conflict = next_state == "conflict"
                     for key in ("request_id", "trace_id"):
                         if state.get(key) != event[key]:
                             errors.append(loc + ".action_state." + key + ": must match stream identity")
+                elif type(state) is dict and state.get("state") == "denied":
+                    action_state = "denied"
         elif "action_state" in event:
             errors.append(loc + ".action_state: only action_state may carry action state")
         if kind == "error":
@@ -278,6 +283,9 @@ def validate_stream(events, path="events", cancellation_after_seq=None):
                 errors.append(loc + ".outcome: invalid terminal outcome")
             if action_state in {"reserved", "outcome_unknown"} and event.get("outcome") != "outcome_unknown":
                 errors.append(loc + ": unresolved commitment requires outcome_unknown")
+            expected_outcome = "denied" if action_conflict else {"confirmed": "completed", "denied": "denied", "failed": "failed"}.get(action_state)
+            if expected_outcome is not None and event.get("outcome") not in {expected_outcome, "cancelled", "outcome_unknown"}:
+                errors.append(loc + ": terminal contradicts known action evidence")
             terminal = True
         event_bytes = len(json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
         if event_bytes > LIMITS["event_data_bytes"]:
@@ -414,16 +422,16 @@ def _validate_preview(value, path, errors):
 
 def _validate_action_state(value, path, errors):
     if not _keys(value, ("state", "readiness"), path, errors,
-                 optional=("action_id", "request_id", "trace_id", "manifest_revision", "capability_id", "existing_state")):
+                 optional=("action_id", "request_id", "trace_id", "manifest_revision", "capability_id", "existing_state", "result")):
         return
     state = value["state"]
-    if state not in ("reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied"):
+    if state not in ("reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied", "confirmed", "failed"):
         errors.append(path + ".state: invalid action state")
         return
     if value["readiness"] not in ("ready", "degraded"):
         errors.append(path + ".readiness: invalid readiness")
     identifiers = ("action_id", "request_id", "trace_id")
-    if state == "denied":
+    if state == "denied" and "action_id" not in value:
         for key in identifiers:
             if key in value:
                 errors.append(path + "." + key + ": denied action state must not identify an action")
@@ -438,10 +446,41 @@ def _validate_action_state(value, path, errors):
         if value.get("capability_id") != "home_assistant.harmless_light":
             errors.append(path + ".capability_id: unsupported capability")
     if state in ("duplicate", "conflict"):
-        if value.get("existing_state") not in ("reserved", "fake_attempted", "outcome_unknown"):
+        if value.get("existing_state") not in ("reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"):
             errors.append(path + ".existing_state: duplicate/conflict requires known state")
     elif "existing_state" in value:
         errors.append(path + ".existing_state: only duplicate/conflict may carry existing state")
+
+    result = value.get("result")
+    expected = value.get("existing_state") if state in {"duplicate", "conflict"} else state
+    if expected in {"reserved", "fake_attempted"} and "result" in value:
+        errors.append(path + ": non-result state forbids evidence")
+    if expected in {"confirmed", "failed"} and result is None:
+        errors.append(path + ": execution requires evidence")
+    if "result" in value:
+        _validate_execution_result(result, path + ".result", errors)
+        if type(result) is dict and result.get("status") != expected:
+            errors.append(path + ": result must match state")
+
+
+def _validate_execution_result(value, path, errors):
+    if not _keys(value, ("status", "reason", "evidence", "power_state", "observed_at"), path, errors):
+        return
+    reasons = {"confirmed": {"observation_confirmed"}, "denied": {"prerequisite_unmet", "adapter_rejected", "service_rejected"}, "failed": {"no_effect_failure"}, "outcome_unknown": {"transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"}}
+    status, evidence = value["status"], value["evidence"]
+    if not isinstance(status, str) or not isinstance(value["reason"], str) or value["reason"] not in reasons.get(status, set()):
+        errors.append(path + ": invalid execution reason")
+    if evidence not in ("none", "accepted", "observed") or (status == "confirmed" and evidence != "observed") or (status in ("denied", "failed") and evidence != "none"):
+        errors.append(path + ": invalid evidence strength")
+    if evidence == "observed":
+        try:
+            if value["power_state"] not in ("on", "off") or not isinstance(value["observed_at"], str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value["observed_at"]) is None:
+                raise ValueError()
+            datetime.strptime(value["observed_at"], "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            errors.append(path + ": invalid observation")
+    elif value["power_state"] is not None or value["observed_at"] is not None:
+        errors.append(path + ": unexpected observation")
 
 
 def validate_turn(turn, path="turn"):

@@ -3,7 +3,7 @@ from .ports import ActionLedgerPort, RequestLedgerPort
 
 
 def recover_actions_and_requests(actions: ActionLedgerPort | None, requests: RequestLedgerPort, occurred_at: str) -> None:
-    """An interrupted reconciliation is safe to repeat, including persisted fake results."""
+    """Reconciliation is repeatable; persisted evidence never authorizes replay."""
     try:
         if actions is not None:
             actions.recover_unresolved(occurred_at)

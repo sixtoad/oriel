@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 import stat
@@ -9,7 +10,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..application.ports import ActionLedgerUnavailable, ActionReadiness, ActionRecord, ActionReservation
+from ..application.ports import ActionExecutionResult, ActionLedgerUnavailable, ActionReadiness, ActionRecord, ActionReservation
 from ..domain.ha_manifest import CAPABILITY_ID, MANIFEST_REVISION
 
 
@@ -26,6 +27,8 @@ class SQLiteActionLedger:
         try:
             self._acquire_owner_lock()
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._migrate(connection)
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS action_ledger (
@@ -35,9 +38,10 @@ class SQLiteActionLedger:
                         manifest_revision TEXT NOT NULL,
                         capability_id TEXT NOT NULL,
                         operation_fingerprint TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK(state IN ('reserved', 'fake_attempted', 'outcome_unknown')),
+                        state TEXT NOT NULL CHECK(state IN ('reserved', 'fake_attempted', 'outcome_unknown', 'confirmed', 'denied', 'failed')),
                         reserved_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        result_json TEXT
                     )
                     """
                 )
@@ -46,7 +50,7 @@ class SQLiteActionLedger:
                     CREATE TABLE IF NOT EXISTS action_audit (
                         audit_id INTEGER PRIMARY KEY,
                         action_id TEXT NOT NULL,
-                        event TEXT NOT NULL CHECK(event IN ('reserved', 'fake_attempted', 'outcome_unknown')),
+                        event TEXT NOT NULL CHECK(event IN ('reserved', 'fake_attempted', 'outcome_unknown', 'confirmed', 'denied', 'failed')),
                         occurred_at TEXT NOT NULL,
                         FOREIGN KEY(action_id) REFERENCES action_ledger(action_id)
                     )
@@ -66,12 +70,12 @@ class SQLiteActionLedger:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 existing = connection.execute(
-                    "SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at "
+                    "SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at, result_json "
                     "FROM action_ledger WHERE request_id = ?",
                     (record.request_id,),
                 ).fetchone()
                 if existing is not None:
-                    existing_record = ActionRecord(*existing)
+                    existing_record = _record(existing)
                     status = "duplicate" if existing_record.operation_fingerprint == record.operation_fingerprint else "conflict"
                     return ActionReservation(status, existing_record)
                 readiness = connection.execute("SELECT state FROM action_readiness WHERE singleton = 1").fetchone()
@@ -94,6 +98,11 @@ class SQLiteActionLedger:
         except (OSError, sqlite3.Error, ValueError):
             self.degrade()
             raise ActionLedgerUnavailable() from None
+
+    def mark_execution_result(self, action_id: str, occurred_at: str, result: ActionExecutionResult) -> ActionRecord:
+        if type(result) is not ActionExecutionResult:
+            raise ActionLedgerUnavailable()
+        return self._transition(action_id, occurred_at, result.status, result)
 
     def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord:
         return self._transition(action_id, occurred_at, "fake_attempted")
@@ -147,30 +156,47 @@ class SQLiteActionLedger:
         except (OSError, sqlite3.Error):
             raise ActionLedgerUnavailable() from None
 
-    def _transition(self, action_id: str, occurred_at: str, state: str) -> ActionRecord:
+    def _transition(self, action_id: str, occurred_at: str, state: str, result: ActionExecutionResult | None = None) -> ActionRecord:
         try:
             _canonical_utc(occurred_at)
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                existing = connection.execute("SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at FROM action_ledger WHERE action_id = ?", (action_id,)).fetchone()
-                if existing is not None and existing[6] in {state, "outcome_unknown"}:
-                    return ActionRecord(*existing)
-                expected = "reserved" if state == "fake_attempted" else "reserved', 'fake_attempted"
+                existing = connection.execute("SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at, result_json FROM action_ledger WHERE action_id = ?", (action_id,)).fetchone()
+                existing_record = _record(existing) if existing is not None else None
+                if existing_record is not None and (existing_record.state in {state, "outcome_unknown"}
+                        or state == "outcome_unknown" and existing_record.state in {"confirmed", "denied", "failed"}):
+                    return existing_record
+                expected = "reserved', 'fake_attempted" if state == "outcome_unknown" else "reserved"
                 cursor = connection.execute(
-                    f"UPDATE action_ledger SET state = ?, updated_at = ? WHERE action_id = ? AND state IN ('{expected}')",
-                    (state, occurred_at, action_id),
+                    f"UPDATE action_ledger SET state = ?, updated_at = ?, result_json = ? WHERE action_id = ? AND state IN ('{expected}')",
+                    (state, occurred_at, json.dumps(result.payload(), separators=(",", ":")) if result else None, action_id),
                 )
                 if cursor.rowcount != 1:
                     raise sqlite3.DatabaseError("missing action")
                 connection.execute("INSERT INTO action_audit (action_id, event, occurred_at) VALUES (?, ?, ?)", (action_id, state, occurred_at))
                 row = connection.execute(
-                    "SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at FROM action_ledger WHERE action_id = ?",
+                    "SELECT action_id, request_id, trace_id, manifest_revision, capability_id, operation_fingerprint, state, reserved_at, updated_at, result_json FROM action_ledger WHERE action_id = ?",
                     (action_id,),
                 ).fetchone()
-            return ActionRecord(*row)
+            return _record(row)
         except (OSError, sqlite3.Error, ValueError):
             self.degrade()
             raise ActionLedgerUnavailable() from None
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """Replace v1 CHECK constraints and copy both tables in one transaction."""
+        columns = connection.execute("PRAGMA table_info(action_ledger)").fetchall()
+        if not columns or "result_json" in {row[1] for row in columns}:
+            return
+        connection.execute("CREATE TABLE action_ledger_v2 (action_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, trace_id TEXT NOT NULL, manifest_revision TEXT NOT NULL, capability_id TEXT NOT NULL, operation_fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','fake_attempted','outcome_unknown','confirmed','denied','failed')), reserved_at TEXT NOT NULL, updated_at TEXT NOT NULL, result_json TEXT)")
+        connection.execute("INSERT INTO action_ledger_v2 SELECT *, NULL FROM action_ledger")
+        connection.execute("CREATE TABLE action_audit_v2 (audit_id INTEGER PRIMARY KEY, action_id TEXT NOT NULL, event TEXT NOT NULL CHECK(event IN ('reserved','fake_attempted','outcome_unknown','confirmed','denied','failed')), occurred_at TEXT NOT NULL, FOREIGN KEY(action_id) REFERENCES action_ledger(action_id))")
+        connection.execute("INSERT INTO action_audit_v2 SELECT * FROM action_audit")
+        connection.execute("DROP TABLE action_audit")
+        connection.execute("DROP TABLE action_ledger")
+        connection.execute("ALTER TABLE action_ledger_v2 RENAME TO action_ledger")
+        connection.execute("ALTER TABLE action_audit_v2 RENAME TO action_audit")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=5, isolation_level=None)
@@ -217,3 +243,20 @@ def _canonical_utc(value: str) -> str:
     if value != canonical:
         raise ValueError("timestamp is not canonical UTC")
     return canonical
+
+
+def _record(row: tuple) -> ActionRecord:
+    try:
+        result = None
+        if row[9] is not None:
+            material = json.loads(row[9])
+            if type(material) is not dict or set(material) != {"status", "reason", "evidence", "power_state", "observed_at"}:
+                raise ValueError("invalid durable evidence")
+            result = ActionExecutionResult(**material)
+            if result.status != row[6]:
+                raise ValueError("invalid durable evidence")
+        elif row[6] in {"confirmed", "denied", "failed"}:
+            raise ValueError("missing durable evidence")
+        return ActionRecord(*row[:9], result=result)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise ValueError("invalid durable evidence") from None

@@ -243,3 +243,136 @@ class HaWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HaExecutionChannelTests(unittest.TestCase):
+    def server(self, directory, executor=None, raw=None):
+        from threading import Event
+        from oriel.adapters.ha_worker_process import _respond
+        channel = Path(directory) / "execute.sock"
+        ready = Event()
+        def serve():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(channel))
+                os.chmod(channel, 0o600)
+                listener.listen(1)
+                ready.set()
+                with listener.accept()[0] as connection:
+                    if raw is None:
+                        _respond(connection, True, executor)
+                    else:
+                        connection.recv(MAX_FRAME_BYTES)
+                        connection.sendall(raw)
+        worker = Thread(target=serve, daemon=True)
+        worker.start()
+        self.assertTrue(ready.wait(2))
+        self.addCleanup(worker.join, 2)
+        return UnixHaWorkerClient(channel)
+
+    def request(self, budget=5):
+        from oriel.application.ports import ActionExecutionRequest
+        from oriel.domain.ha_manifest import execution_eligibility, canonical_ha_proposal
+        from tests.test_ha_execution import MANIFEST
+        proposal = execution_eligibility(canonical_ha_proposal("on"), manifest=MANIFEST).material
+        return ActionExecutionRequest(proposal, time.monotonic() + budget)
+
+    def test_default_worker_denies_execution_even_with_connection_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.server(directory).execute(self.request())
+            self.assertEqual(result.status, "denied")
+            self.assertEqual(result.reason, "prerequisite_unmet")
+
+    def test_execution_round_trip_returns_only_fresh_bounded_observation(self):
+        from oriel.adapters.ha_execution import HarmlessHaExecutor, WorkerObservation
+        from oriel.application.ports import BoundedHomeFact
+        from tests.test_ha_execution import MANIFEST, NOW
+        calls = []
+        class FixedProvider:
+            def set_power(self, state, deadline):
+                calls.append(("set", state, deadline))
+                return "accepted"
+            def observe(self, deadline):
+                calls.append(("observe", deadline))
+                return WorkerObservation(BoundedHomeFact("on", NOW, "fresh"), time.monotonic())
+        executor = HarmlessHaExecutor(FixedProvider(), MANIFEST, scope="controlled_fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.server(directory, executor).execute(self.request())
+            self.assertEqual(result.status, "confirmed")
+            self.assertEqual([c[0] for c in calls], ["set", "observe"])
+            self.assertEqual(calls[0][-1], calls[1][-1])
+
+    def test_ipc_deadline_is_cumulative_and_late_result_cannot_claim_success(self):
+        from oriel.application.ports import ActionExecutionResult
+        class SlowExecutor:
+            def execute(self, request):
+                time.sleep(.15)
+                return ActionExecutionResult("confirmed", "observation_confirmed", "observed", "on", "2026-10-09T00:00:00Z")
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.server(directory, SlowExecutor())
+            start = time.monotonic()
+            result = client.execute(self.request(.04))
+            self.assertEqual(result.status, "outcome_unknown")
+            self.assertLess(time.monotonic() - start, .12)
+
+    def test_untrusted_result_canaries_and_extra_fields_are_sanitized(self):
+        from oriel.adapters.ha_worker import execution_response
+        from oriel.application.ports import ActionExecutionResult
+        good = execution_response(ActionExecutionResult("confirmed", "observation_confirmed", "observed", "off", "2026-10-09T00:00:00Z"))
+        for raw in (good, b'{"version":"1","status":"PRIVATE_CANARY"}\n', b'x' * (MAX_FRAME_BYTES + 1) + b'\n'):
+            with tempfile.TemporaryDirectory() as directory:
+                result = self.server(directory, raw=raw).execute(self.request())
+                self.assertEqual(result.status, "outcome_unknown")
+                self.assertNotIn("PRIVATE_CANARY", repr(result))
+
+    def test_complete_matching_confirmation_requires_valid_observation_time(self):
+        import json
+        from oriel.adapters.ha_worker import execution_response
+        from oriel.application.ports import ActionExecutionResult
+        original = json.loads(execution_response(ActionExecutionResult("confirmed", "observation_confirmed", "observed", "on", "2026-10-09T00:00:00Z")))
+        replies = []
+        for timestamp in ("PRIVATE_CANARY", "", None, "2026-99-99T99:99:99Z", "2026-02-30T00:00:00Z"):
+            replies.append({**original, "observed_at": timestamp})
+        replies.append({key: value for key, value in original.items() if key != "observed_at"})
+        for reply in replies:
+            with self.subTest(reply=reply), tempfile.TemporaryDirectory() as directory:
+                raw = json.dumps(reply, separators=(",", ":")).encode() + b"\n"
+                result = self.server(directory, raw=raw).execute(self.request())
+                self.assertEqual(result.status, "outcome_unknown")
+                self.assertIsNone(result.observed_at)
+                self.assertNotIn("PRIVATE_CANARY", repr(result))
+
+
+class HaExecutionReplyBudgetTests(unittest.TestCase):
+    def test_reply_uses_only_remaining_budget_and_never_retries_execution_reply(self):
+        from unittest.mock import patch
+        from oriel.adapters.ha_worker_process import _respond
+        from oriel.application.ports import ActionExecutionResult
+        for mode in ("success", "expired", "send_timeout", "execution_failure"):
+            with self.subTest(mode=mode):
+                elapsed = [0.0]
+                class Connection:
+                    def __init__(self):
+                        self.timeouts, self.sends = [], []
+                    def settimeout(self, value):
+                        self.timeouts.append(value)
+                    def sendall(self, value):
+                        self.sends.append(value)
+                        if mode == "send_timeout":
+                            elapsed[0] += self.timeouts[-1]
+                            raise TimeoutError()
+                class Executor:
+                    def execute(self, request):
+                        elapsed[0] = 5.0 if mode == "expired" else 4.75
+                        if mode == "execution_failure": raise OSError("PRIVATE_CANARY")
+                        return ActionExecutionResult("confirmed", "observation_confirmed", "observed", "on", "2026-10-09T00:00:00Z")
+                connection = Connection()
+                request = {"version": "1", "type": "execute", "desired_state": "on", "deadline": "5.0"}
+                with patch("oriel.adapters.ha_worker_process.receive_worker_request", return_value=request), patch("oriel.adapters.ha_worker.time.monotonic", side_effect=lambda: elapsed[0]):
+                    _respond(connection, True, Executor())
+                if mode in {"success", "send_timeout"}:
+                    self.assertEqual(connection.timeouts, [1.0, .25])
+                    self.assertEqual(len(connection.sends), 1)
+                else:
+                    self.assertEqual(connection.timeouts, [1.0])
+                    self.assertEqual(connection.sends, [])
+                self.assertLessEqual(elapsed[0], 5.0)

@@ -12,17 +12,17 @@ Before acceptance, invalid input returns 400, a missing or expired reference 404
 
 `POST .../turns` is non-replayable. The first event is `accepted`. Each event has `api_version`, request, session, and trace IDs, a context generation, and a strictly increasing positive `seq`. Only `accepted`, `ack`, `content_delta`, `proposal`, `fact`, `validation`, `action_state`, `error`, and `terminal` occur. `terminal` appears exactly once, last, with `completed`, `denied`, `failed`, `cancelled`, or `outcome_unknown`; no later event is valid.
 
-`action_state` is bounded, payload-free reservation evidence for the test-only fake action seam. It carries opaque identities, manifest/capability revisions, readiness, and state only; it never enables provider I/O, exposes an audit query, or claims an observed home outcome.
+`action_state` carries bounded reservation and execution evidence: opaque identities, manifest/capability revisions, readiness, state, and an optional closed result. It exposes neither raw arguments nor an audit query. Only a durable `confirmed` result supports an observed-outcome claim; the retained test-only `fake_attempted` state remains a simulation.
 
 `content_delta` always carries `content`; `error` always carries the safe error object; and `terminal` always carries `outcome`. A harmless-light `proposal` contains only its canonical operation, synthetic alias, closed `desired_state`, and manifest revision. Its following `validation` event carries a `preview`: `simulated` contains the same canonical material and makes no state-change claim; `denied` and `unavailable` contain only a bounded reason. The preview path never dispatches an action. `ack` is optional, nonterminal, at most once, before useful content, and carries only the bounded `message` `Work is continuing.`; it has no outcome because it does not state approval or completion. The gateway schedules it 500 ms after durable admission only while a Qwen route has no useful content or proposal, and atomically suppresses it on useful output, cancellation, or terminal. Unknown event fields are permitted for stream evolution. Unknown fields in configuration, manifests, proposals, and action-result documents are rejected.
 
 `content_delta` always carries `content`; `fact` always carries exactly `power_state`, `observed_at`, and `freshness`; `error` always carries the safe error object; and `terminal` always carries `outcome`. A `fresh` or `stale` fact has an `on` or `off` power state and a valid UTC observation time; an `unavailable` fact has null observation values. No other event type may carry `fact`.
 
-Cancellation returns a typed acknowledgement. `cancellation_requested` means a live request received the cancellation request and has no outcome; its eventual stream terminal is authoritative. Repeating a live cancellation returns the same acknowledgement. `already_terminal` means a terminal outcome won the race and includes that outcome. An unavailable request returns the sanitized 404 reference error. Passive `in_progress` and `unavailable` status similarly have no outcome, while `terminal` has exactly one. A cancellation may end the accepted stream directly with `terminal: cancelled`, or may emit one typed cancellation error before that terminal; neither form replays content or starts work. A disconnected client is treated as cancellation; reconnect by querying status, never by reposting the turn. Cancellation is cooperative for an upstream stream, so an upstream may not stop immediately. After acknowledgement the gateway suppresses generated content, proposals, previews, acknowledgements, facts, and transcript updates. A previously committed action may still emit its bounded `reserved` evidence and one `fake_attempted` or `outcome_unknown` result for the same action identity. A known fake attempt may end `cancelled`; unresolved committed work must end `outcome_unknown`, including passive terminal status. Neither cancellation nor any fake-action state claims undo or physical completion.
+Cancellation returns a typed acknowledgement. `cancellation_requested` means a live request received the cancellation request and has no outcome; its eventual stream terminal is authoritative. Repeating a live cancellation returns the same acknowledgement. `already_terminal` means a terminal outcome won the race and includes that outcome. An unavailable request returns the sanitized 404 reference error. Passive `in_progress` and `unavailable` status similarly have no outcome, while `terminal` has exactly one. A cancellation may end the accepted stream directly with `terminal: cancelled`, or may emit one typed cancellation error before that terminal; neither form replays content or starts work. A disconnected client is treated as cancellation; reconnect by querying status, never by reposting the turn. Cancellation is cooperative for an upstream stream, so an upstream may not stop immediately. After acknowledgement the gateway suppresses generated content, proposals, previews, acknowledgements, facts, and transcript updates. A previously committed action may still emit its bounded `reserved` evidence and one final `confirmed`, `denied`, `failed`, `fake_attempted`, or `outcome_unknown` result for the same action identity. Durable confirmed evidence or a known fake attempt may accompany `cancelled`; unresolved committed work must end `outcome_unknown`, including passive terminal status. Neither cancellation nor any fake-action state claims undo or physical completion.
 
 ## Canonical JSON and limits
 
-Canonical JSON is UTF-8 with lexicographically ordered object keys, no duplicate keys, and no non-finite number. Limits are 16 KiB input, 32 context messages and 64 KiB total context, 10 open sessions, 2 active turns, queue depth 8, a 30-second model deadline, five seconds per provider connect or read operation, 64 KiB accumulated streamed content, and 8 KiB serialized event data. Queued admitted turns receive `accepted`, retain their request IDs, start FIFO, and may be cancelled before model invocation. An exceeded total deadline emits `model_deadline` in the `timeout` category and then one failed terminal; late output cannot reach the stream or transcript.
+Canonical JSON is UTF-8 with lexicographically ordered object keys, no duplicate keys, and no non-finite number. Limits are 16 KiB input, 32 context messages and 64 KiB total context, 10 open sessions, 2 active turns, queue depth 8, a 30-second model deadline, five seconds per model provider connect or read operation and one cumulative five-second HA execution budget, 64 KiB accumulated streamed content, and 8 KiB serialized event data. Queued admitted turns receive `accepted`, retain their request IDs, start FIFO, and may be cancelled before model invocation. An exceeded total deadline emits `model_deadline` in the `timeout` category and then one failed terminal; late output cannot reach the stream or transcript.
 
 ## Configuration and generic actions
 
@@ -34,12 +34,41 @@ The manifest, proposal, and result grammar is generic and versioned. Targets are
 
 After durable admission and before model work, the gateway applies a fixed application-owned router revision to normalized bounded input and retained bounded context. Its supported exact request is `oriel help`; it completes with deterministic content and never calls a model. Ambiguous control requests complete with `Please clarify your request.` Unsupported live weather, time, music, and home-state requests complete with an explicit limitation. Protected or multiple-action language emits a typed policy denial and `terminal: denied`. The exact request `create a synthetic proposal` may emit one validated, dry-run generic synthetic proposal through the same proposal boundary used by model output; it never dispatches a tool. Other requests use the configured model route.
 
-Each routed turn emits one correlated payload-free route record containing the route, rule revision, and routing duration. The gateway separately records payload-free acknowledgement, first-model-token, first-useful-content, and terminal timings. The router never exposes evaluator fixtures, selects a real action or target, fabricates live state, changes request identities, or alters the stream schema.
+Each routed turn emits one correlated payload-free route record containing the route, rule revision, and routing duration. The gateway separately records payload-free acknowledgement, first-model-token, first-useful-content, and terminal timings. The router never exposes evaluator fixtures, selects a real target mapping, fabricates live state, changes request identities, or alters the stream schema. Only the explicit reviewed-light commands select execution intent.
 
 ## Evidence procedure
 
 Run `python3 scripts/validate_api_contract.py api/examples` offline. Run `python3 scripts/sse_probe.py --self-test` to obtain local direct-delivery and disconnect evidence. A supported direct and Ingress placement must each run the probe and retain only sanitized timing/outcome evidence. Until an Ingress run is recorded, Ingress evidence is incomplete; the local self-test is not a gateway or Ingress result.
 
-Successful atomic reservation plus its required audit is dispatch commitment. Final lifecycle, generation, policy/manifest revision, deadline and action readiness checks serialize with commitment. Any policy activation, including disable/re-enable, invalidates prior validation. Synchronization is released before the single test fake attempt. Production configuration remains restart-applied and production dispatch remains disabled.
+Successful atomic reservation plus its required audit is dispatch commitment. Final lifecycle, generation, policy/manifest revision, deadline and action readiness checks serialize with commitment. Any policy activation, including disable/re-enable, invalidates prior validation. Synchronization is released before the single execution or test fake attempt. Production configuration remains restart-applied and production dispatch remains disabled.
 
 Startup recovers unresolved action reservations as `outcome_unknown` before reconciling request status. Unreserved interrupted requests become `failed`; interrupted committed requests with missing evidence become `outcome_unknown`. Recovery repeats conservatively if interrupted between ledger updates; recovered terminal records cannot be overwritten by stale callbacks. Required storage/recovery failures fail closed and degrade action readiness. Diagnostic export failures do not gate commitment. Recovery never regenerates model output or replays actions.
+
+### Bounded action execution evidence
+
+Turn submission fields are unchanged. The explicit text commands `turn on the
+reviewed harmless light` and `turn off the reviewed harmless light` select the
+sole execution operation. Preview commands and model proposals never authorize
+execution. Shipping execution remains disabled until separately reviewed effect,
+restricted-call-path, excluded-operation-denial, and observation prerequisites
+are revalidated for the active manifest.
+
+An `action_state` event may report `confirmed`, `denied`, `failed`, or
+`outcome_unknown`. Its optional `result` is closed: `status`, `reason`, `evidence`
+(`none`, `accepted`, or `observed`), `power_state`, and `observed_at`. Confirmed
+results require observed evidence with a bounded on/off state and UTC observation
+time; absent observations use null fields. The adapter must obtain a fresh
+matching observation after the one dispatch within the same five-second
+monotonic budget. Acceptance alone never means completion. Confirmed/failed
+execution states require a result. A pre-commit denial has no action identifiers;
+a worker denial after commitment retains the reservation's identifiers.
+
+The gateway persists evidence before emitting it. A confirmed action ordinarily
+ends the turn as `completed`; known denial/failure uses the corresponding outcome.
+Cancellation can coexist with durable confirmed action evidence and suppresses
+all generated content. An unresolved committed action ends as `outcome_unknown`,
+including after cancellation. At most one reservation and one final action result
+are emitted; duplicate/conflicting identities never cause another dispatch.
+Recovery never replays, and late results cannot overwrite uncertainty. The
+reference client uses deterministic observation-based wording and labels
+uncertainty as completion unproven with no retry.

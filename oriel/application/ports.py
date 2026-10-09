@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, ContextManager, Iterable, Mapping, Protocol
 
 if TYPE_CHECKING:
-    from ..domain.ha_manifest import FactRequest
+    from ..domain.ha_manifest import FactRequest, CanonicalProposal
 
 
 _UTC_TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -298,6 +298,44 @@ class DryRunPreviewPort(Protocol):
     def preview(self, proposal: object) -> DryRunPreview: ...
 
 
+EXECUTION_REASONS = frozenset({"observation_confirmed", "prerequisite_unmet", "adapter_rejected", "service_rejected", "no_effect_failure", "transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"})
+
+
+@dataclass(frozen=True)
+class ActionExecutionResult:
+    """Closed evidence, suitable for durable storage and public reporting."""
+    status: str
+    reason: str
+    evidence: str = "none"
+    power_state: str | None = None
+    observed_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"confirmed", "denied", "failed", "outcome_unknown"} or self.reason not in EXECUTION_REASONS or self.evidence not in {"none", "accepted", "observed"}:
+            raise ValueError("invalid execution result")
+        if self.evidence == "observed":
+            BoundedHomeFact(self.power_state, self.observed_at, "fresh")
+        elif self.power_state is not None or self.observed_at is not None:
+            raise ValueError("unexpected execution observation")
+        allowed = {"confirmed": {"observation_confirmed"}, "denied": {"prerequisite_unmet", "adapter_rejected", "service_rejected"}, "failed": {"no_effect_failure"}, "outcome_unknown": {"transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"}}
+        if self.reason not in allowed[self.status] or (self.status == "confirmed" and self.evidence != "observed") or (self.status in {"denied", "failed"} and self.evidence != "none"):
+            raise ValueError("inconsistent execution evidence")
+
+    def payload(self) -> dict[str, object]:
+        return {"status": self.status, "reason": self.reason, "evidence": self.evidence,
+                "power_state": self.power_state, "observed_at": self.observed_at}
+
+
+@dataclass(frozen=True)
+class ActionExecutionRequest:
+    proposal: "CanonicalProposal"
+    deadline: float
+
+
+class ActionExecutionPort(Protocol):
+    def execute(self, request: ActionExecutionRequest) -> ActionExecutionResult: ...
+
+
 @dataclass(frozen=True)
 class ActionRecord:
     """Payload-free durable state for one server-owned synthetic action."""
@@ -311,9 +349,10 @@ class ActionRecord:
     state: str
     reserved_at: str
     updated_at: str
+    result: ActionExecutionResult | None = None
 
     def __post_init__(self) -> None:
-        if self.state not in {"reserved", "fake_attempted", "outcome_unknown"}:
+        if self.state not in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}:
             raise ValueError("invalid action record state")
         if not all(isinstance(value, str) and value for value in (
             self.action_id, self.request_id, self.trace_id, self.manifest_revision,
@@ -353,6 +392,8 @@ class ActionLedgerPort(Protocol):
     """Separates action reservation/audit from request lifecycle storage."""
 
     def reserve_and_audit(self, record: ActionRecord) -> ActionReservation: ...
+
+    def mark_execution_result(self, action_id: str, occurred_at: str, result: ActionExecutionResult) -> ActionRecord: ...
 
     def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord: ...
 

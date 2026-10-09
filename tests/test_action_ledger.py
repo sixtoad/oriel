@@ -99,6 +99,32 @@ class SQLiteActionLedgerTests(unittest.TestCase):
             self.assertEqual(ledger.readiness().state, "degraded")
             self.assertEqual(ledger.reserve_and_audit(record()).status, "duplicate")
 
+    def test_malformed_persisted_result_degrades_and_raises_only_ledger_unavailable(self):
+        import json
+        from oriel.application.ports import ActionExecutionResult
+        valid = ActionExecutionResult("confirmed", "observation_confirmed", "observed", "on", "2026-10-07T10:00:00Z")
+        malformed = ["[]", "null", "1", '\"PRIVATE_CANARY\"', "{", json.dumps({**valid.payload(), "extra": "PRIVATE_CANARY"}),
+                     json.dumps({**valid.payload(), "status": []}), json.dumps({**valid.payload(), "reason": {}})]
+        for material in malformed:
+            with self.subTest(material=material), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "actions.db"
+                ledger = SQLiteActionLedger(path)
+                ledger.reserve_and_audit(record())
+                ledger.mark_execution_result("action-1", record().updated_at, valid)
+                with ledger._connect() as connection:
+                    connection.execute("UPDATE action_ledger SET result_json = ?", (material,))
+                ledger.close()
+                ledger = SQLiteActionLedger(path)
+                self.addCleanup(ledger.close)
+                for operation in (lambda: ledger.reserve_and_audit(record()), lambda: ledger.mark_outcome_unknown("action-1", record().updated_at)):
+                    with self.assertRaises(ActionLedgerUnavailable) as raised:
+                        operation()
+                    self.assertNotIn("PRIVATE_CANARY", str(raised.exception))
+                    self.assertEqual(ledger.readiness().state, "degraded")
+                with ledger._connect() as connection:
+                    self.assertEqual(connection.execute("SELECT state, result_json FROM action_ledger").fetchone(), ("confirmed", material))
+
+
 
 class _ProposalModel:
     def stream(self, input, cancellation):

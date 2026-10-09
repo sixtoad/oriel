@@ -12,10 +12,72 @@ API = ROOT / "api"
 EXAMPLES = API / "examples"
 CLI = ROOT / "scripts" / "validate_api_contract.py"
 sys.path.insert(0, str(ROOT))
-from scripts.validate_api_contract import load_json, validate_directory, validate_fixture, validate_stream, validate_turn
+from scripts.validate_api_contract import load_json, validate_directory, validate_fixture, validate_stream, validate_turn, _validate_action_state
+
+
+def execution_evidence_cases():
+    """Shared schema/validator regression inputs; no external schema dependency."""
+    confirmed = load_json(EXAMPLES / "valid" / "execution-confirmed.json")["events"][-2]["action_state"]
+    unknown = load_json(EXAMPLES / "valid" / "execution-unknown.json")["events"][-2]["action_state"]["result"]
+    cases = []
+    for state in ("reserved", "fake_attempted"):
+        cases.append((f"{state}-result", {**confirmed, "state": state}, False))
+        cases.append((f"{state}-null-result", {**confirmed, "state": state, "result": None}, False))
+    for state in ("duplicate", "conflict"):
+        for existing in ("reserved", "fake_attempted", "confirmed", "denied", "failed", "outcome_unknown"):
+            result = unknown if existing == "confirmed" else confirmed["result"]
+            cases.append((f"{state}-{existing}-contradiction", {**confirmed, "state": state, "existing_state": existing, "result": result}, False))
+        cases.append((f"{state}-confirmed-valid", {**confirmed, "state": state, "existing_state": "confirmed"}, True))
+    cases.append(("confirmed-valid", confirmed, True))
+    return cases
 
 
 class ApiContractTests(unittest.TestCase):
+    def test_schema_and_offline_validator_restrict_result_by_current_or_existing_state(self):
+        schema = load_json(API / "schemas" / "action-state.json")
+        self.assertIn({"if": {"properties": {"state": {"enum": ["reserved", "fake_attempted"]}}},
+                       "then": {"not": {"required": ["result"]}}}, schema["allOf"])
+        for state in ("reserved", "fake_attempted", "confirmed", "denied", "failed", "outcome_unknown"):
+            condition = {"properties": {"state": {"enum": ["duplicate", "conflict"]}, "existing_state": {"const": state}}, "required": ["existing_state"]}
+            branch = next(rule["then"] for rule in schema["allOf"] if rule.get("if") == condition)
+            if state in ("reserved", "fake_attempted"):
+                self.assertEqual(branch, {"not": {"required": ["result"]}})
+            else:
+                self.assertEqual(branch["properties"]["result"]["properties"]["status"], {"const": state})
+                if state in ("confirmed", "failed"):
+                    self.assertEqual(branch["required"], ["result"])
+        for label, payload, valid in execution_evidence_cases():
+            with self.subTest(case=label):
+                errors = []
+                _validate_action_state(payload, "action", errors)
+                self.assertEqual(not errors, valid, errors)
+
+    def test_known_action_evidence_constrains_terminal_outcome(self):
+        original = load_json(EXAMPLES / "valid" / "execution-confirmed.json")["events"]
+        for state, reason, expected in (("confirmed", "observation_confirmed", "completed"), ("denied", "service_rejected", "denied"), ("failed", "no_effect_failure", "failed")):
+            for terminal in ("completed", "denied", "failed", "cancelled", "outcome_unknown"):
+                with self.subTest(state=state, terminal=terminal):
+                    events = copy.deepcopy(original)
+                    action = events[-2]["action_state"]
+                    action["state"] = state
+                    action["result"].update(status=state, reason=reason)
+                    if state != "confirmed":
+                        action["result"].update(evidence="none", power_state=None, observed_at=None)
+                    events[-1]["outcome"] = terminal
+                    errors = validate_stream(events)
+                    self.assertEqual(not errors, terminal in {expected, "cancelled", "outcome_unknown"}, errors)
+
+    def test_identifier_free_denial_after_cancellation_is_not_committed_evidence(self):
+        original = load_json(EXAMPLES / "valid" / "execution-confirmed.json")["events"]
+        events = [copy.deepcopy(original[0]), copy.deepcopy(original[-2]), copy.deepcopy(original[-1])]
+        events[1]["action_state"] = {"state": "denied", "readiness": "ready"}
+        events[-1]["outcome"] = "cancelled"
+        for index, event in enumerate(events, 1): event["seq"] = index
+        self.assertEqual(validate_stream(events), [])
+        self.assertIn("only committed action evidence", " ".join(validate_stream(events, cancellation_after_seq=1)))
+        events[-1]["outcome"] = "completed"
+        self.assertIn("terminal contradicts known action evidence", " ".join(validate_stream(events)))
+
     def test_cancelled_action_evidence_preserves_uncertainty_and_bounds(self):
         for filename in ("cancelled-action-known", "cancelled-action-unknown"):
             self.assertEqual(validate_fixture(load_json(ROOT / "api" / "examples" / "valid" / (filename + ".json"))), [])
@@ -57,6 +119,24 @@ class ApiContractTests(unittest.TestCase):
             events[-1]["outcome"] = "denied" if state == "conflict" else "completed"
             self.assertEqual(validate_stream(events), [])
 
+    def test_conflicts_deny_known_actions_but_preserve_unresolved_commitment(self):
+        original = load_json(EXAMPLES / "valid" / "execution-confirmed.json")["events"]
+        for existing in ("confirmed", "failed", "reserved", "outcome_unknown"):
+            for terminal in ("denied", "completed", "failed", "cancelled", "outcome_unknown"):
+                with self.subTest(existing=existing, terminal=terminal):
+                    events = copy.deepcopy(original)
+                    events.pop(-3)  # A conflict reports existing evidence, without a new reservation.
+                    action = events[-2]["action_state"]
+                    action.update(state="conflict", existing_state=existing)
+                    if existing == "failed":
+                        action["result"].update(status="failed", reason="no_effect_failure", evidence="none", power_state=None, observed_at=None)
+                    elif existing in {"reserved", "outcome_unknown"}:
+                        action.pop("result")
+                    events[-1]["outcome"] = terminal
+                    allowed = {"outcome_unknown"} if existing in {"reserved", "outcome_unknown"} else {"denied", "cancelled", "outcome_unknown"}
+                    errors = validate_stream(events)
+                    self.assertEqual(not errors, terminal in allowed, errors)
+
     def test_after_cancellation_only_one_matching_typed_error_is_valid(self):
         original = load_json(EXAMPLES / "valid" / "cancelled-action-known.json")["events"]
         error = {**original[-1], "type": "error", "error": {"code": "request_cancelled", "category": "cancellation", "message": "Request was cancelled.", "retryable": False, "request_id": "req-1", "session_id": "ses-1", "trace_id": "tr-1"}}
@@ -96,7 +176,7 @@ class ApiContractTests(unittest.TestCase):
     def test_fixture_matrix_is_validated_offline(self):
         result = self.cli(offline_guard=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "Valid API contract fixtures: 17 valid; 13 invalid.\n")
+        self.assertEqual(result.stdout, "Valid API contract fixtures: 19 valid; 13 invalid.\n")
         self.assertEqual(result.stderr, "")
 
     def test_every_matrix_fixture_has_its_expected_result(self):
