@@ -35,6 +35,41 @@ The probe is neither a gateway nor Ingress evidence. Run it through each
 supported direct and Ingress placement separately; until sanitized Ingress
 evidence is retained, that criterion remains incomplete.
 
+The [harmless Home Assistant capability contract](docs/harmless-home-assistant-skill.md)
+defines the one selected synthetic light capability. It remains disabled while
+the restricted provider call path is unverified; the contract test is offline
+and makes no Home Assistant call:
+
+```sh
+python3 -m unittest tests.test_harmless_home_assistant_skill -v
+```
+
+The matching runtime manifest is built in and remains disabled. Optional
+`home_assistant` configuration may only narrow its synthetic target and read
+fields; malformed or expanding restrictions disable that optional skill. Typed
+proposals are validated before the tool boundary, retain no caller-selected
+deadline, authority, provider, dry-run, or idempotency controls, and are denied
+while the permission and completion prerequisites are incomplete. Validate the
+runtime policy without provider calls:
+
+```sh
+python3 -m unittest tests.test_ha_manifest -v
+```
+
+When the optional HA worker is introduced, it is started separately and owns
+its opaque provider connection input. The gateway receives only the local
+worker channel location and observes a fixed availability result; it never
+receives the worker input. Replace that input in the worker's own environment
+or secret mount, stop the worker, and start a replacement worker on the same
+channel. Restart the gateway to re-probe it. The worker exposes no Home
+Assistant reads or actions at this stage.
+
+The worker is an adapter-private process: start it with a protected absolute
+channel selected by the deployment, and give its service environment the
+worker-only input. The channel directory must not be writable by other users;
+the worker creates an owner-only socket and removes it on a normal stop. No
+gateway command starts or restarts the worker.
+
 A [sanitized captured reference-text report](evaluation/captures/2026-09-17-reference-text/README.md)
 replays a real existing local-Qwen backend measurement. It is deliberately
 limited to the text backend and does not represent full Assist or voice evidence.
@@ -51,15 +86,34 @@ python3 scripts/demo_text_gateway.py --self-test
 
 It prints stable JSON for `/live`, `/ready`, and an internal fake-model text
 turn. To exercise the public stream locally, start `python3 -m oriel`, then in
-another terminal create a session and submit a turn:
+another terminal use the dependency-free reference client:
 
 ```sh
-curl -s -X POST http://127.0.0.1:8080/v1/sessions
-curl -N -X POST http://127.0.0.1:8080/v1/sessions/<session_id>/turns \
-  -H 'content-type: application/json' --data '{"input":"hello"}'
-curl -s -X POST http://127.0.0.1:8080/v1/requests/<request_id>/cancel
-curl -s http://127.0.0.1:8080/v1/requests/<request_id>
+python3 scripts/text_client.py start 'hello'
+# Copy the displayed session_id to continue an existing session.
+python3 scripts/text_client.py continue <session_id> 'another question'
+# Copy the displayed request_id to request cancellation or inspect it passively.
+python3 scripts/text_client.py cancel <request_id>
+python3 scripts/text_client.py status <request_id>
 ```
+
+Pass `--endpoint http://host:port` before the subcommand for another local
+gateway address. `start` creates a session and submits its first turn;
+`continue` submits a turn to the supplied session. The client prints
+`accepted` identifiers immediately, labels the optional acknowledgement apart
+from streamed answer text, and reports the final typed terminal outcome. A
+proposal is always labelled `UNTRUSTED DRY-RUN`; it is a proposal, never a
+completed action.
+
+If a stream ends after `accepted` but before `terminal`, the client performs
+one passive `status` lookup for that request and does not replay the turn. If
+the stream ends before `accepted`, it reports `outcome_unknown` and does not
+make a status request or resend the POST. HTTP errors, cancellation responses,
+and status responses are rendered from their structured fields. For an easy
+local disconnection/recovery exercise, stop the client after it prints its
+`accepted` line and run `python3 scripts/text_client.py status <request_id>`;
+the gateway treats the disconnected stream as cancellation, so its eventual
+terminal status is authoritative.
 
 Session context is volatile and isolated by its opaque session handle. A first
 turn may supply `context`; later turns use the retained transcript only. Reset

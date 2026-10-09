@@ -24,7 +24,7 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(
             result.stdout,
-            '{"api_version":"1.0","fake_turn":{"text":"The fake model is ready."},"live":{"api_version":"1.0","state":"live"},"ready":{"api_version":"1.0","state":"ready"}}\n',
+            '{"api_version":"1.0","fake_turn":{"text":"The fake model is ready."},"live":{"api_version":"1.0","state":"live"},"ready":{"api_version":"1.0","components":{"core":{"state":"ready"},"ha":{"state":"disabled"},"model":{"state":"ready"}},"state":"ready"}}\n',
         )
         self.assertEqual(json.loads(result.stdout)["ready"]["state"], "ready")
 
@@ -50,6 +50,19 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         source = DEMO.read_text(encoding="utf-8") + (ROOT / "oriel" / "adapters" / "bootstrap.py").read_text(encoding="utf-8")
         self.assertNotIn("requests", source)
         self.assertNotIn("homeassistant", source.lower())
+
+    def test_demo_output_does_not_disclose_an_unrelated_worker_input(self):
+        canary = "CANARY_MUST_NOT_APPEAR_IN_DEMO"
+        result = subprocess.run(
+            [sys.executable, str(DEMO), "--self-test"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env={"ORIEL_HA_WORKER_CONNECTION_REF": canary},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(canary, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

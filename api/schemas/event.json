@@ -2,27 +2,48 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oriel.invalid/api/1.0/schemas/event.json",
   "title": "Oriel 1.0 stream event",
+  "description": "A committed action emits its reservation and one bounded result. Confirmation requires durable fresh matching post-dispatch observation. Cancellation suppresses generated content but may retain confirmed evidence; uncertainty requires outcome_unknown and never retries.",
   "type": "object",
   "additionalProperties": true,
   "required": ["api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"],
   "properties": {
     "api_version": {"const": "1.0"},
-    "type": {"enum": ["accepted", "ack", "content_delta", "proposal", "validation", "action_state", "error", "terminal"]},
+    "type": {"enum": ["accepted", "ack", "content_delta", "proposal", "fact", "validation", "action_state", "error", "terminal"]},
     "request_id": {"$ref": "common.json#/$defs/opaque_id"},
     "session_id": {"$ref": "common.json#/$defs/opaque_id"},
     "trace_id": {"$ref": "common.json#/$defs/opaque_id"},
     "context_generation": {"type": "integer", "minimum": 0},
     "seq": {"type": "integer", "minimum": 1},
+    "message": {"const": "Work is continuing."},
     "content": {"type": "string", "maxLength": 65536},
-    "proposal": {"$ref": "proposal.json"},
+    "proposal": {"oneOf": [{"$ref": "proposal.json"}, {"$ref": "ha-proposal.json"}]},
+    "preview": {"$ref": "ha-preview.json"},
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["power_state", "observed_at", "freshness"],
+      "properties": {
+        "power_state": {"oneOf": [{"type": "string", "enum": ["on", "off"]}, {"type": "null"}]},
+        "observed_at": {"oneOf": [{"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "maxLength": 20}, {"type": "null"}]},
+        "freshness": {"enum": ["fresh", "stale", "unavailable"]}
+      },
+      "allOf": [
+        {"if": {"properties": {"freshness": {"const": "unavailable"}}}, "then": {"properties": {"power_state": {"type": "null"}, "observed_at": {"type": "null"}}}, "else": {"properties": {"power_state": {"type": "string", "enum": ["on", "off"]}, "observed_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "maxLength": 20}}}}
+      ]
+    },
+    "action_state": {"$ref": "action-state.json"},
     "outcome": {"enum": ["completed", "denied", "failed", "cancelled", "outcome_unknown"]},
     "error": {"$ref": "error.json#/properties/error"}
   },
   "allOf": [
     {"if": {"properties": {"type": {"const": "content_delta"}}}, "then": {"required": ["content"]}},
     {"if": {"properties": {"type": {"const": "proposal"}}}, "then": {"required": ["proposal"]}},
+    {"if": {"properties": {"type": {"const": "fact"}}}, "then": {"required": ["fact"]}, "else": {"not": {"required": ["fact"]}}},
+    {"if": {"properties": {"type": {"const": "validation"}}}, "then": {"required": ["preview"]}, "else": {"not": {"required": ["preview"]}}},
+    {"if": {"properties": {"type": {"const": "action_state"}}}, "then": {"required": ["action_state"]}, "else": {"not": {"required": ["action_state"]}}},
+    {"if": {"properties": {"type": {"const": "action_state"}}}, "then": {"not": {"anyOf": [{"required": ["content"]}, {"required": ["proposal"]}, {"required": ["preview"]}, {"required": ["error"]}, {"required": ["outcome"]}]}}},
     {"if": {"properties": {"type": {"const": "error"}}}, "then": {"required": ["error"]}},
     {"if": {"properties": {"type": {"const": "terminal"}}}, "then": {"required": ["outcome"]}},
-    {"if": {"properties": {"type": {"const": "ack"}}}, "then": {"not": {"required": ["outcome"]}}}
+    {"if": {"properties": {"type": {"const": "ack"}}}, "then": {"required": ["message"], "properties": {"api_version": {}, "type": {}, "request_id": {}, "session_id": {}, "trace_id": {}, "context_generation": {}, "seq": {}, "message": {"const": "Work is continuing."}}, "additionalProperties": false, "not": {"anyOf": [{"required": ["content"]}, {"required": ["proposal"]}, {"required": ["error"]}, {"required": ["outcome"]}]}}, "else": {"not": {"required": ["message"]}}}
   ]
 }
