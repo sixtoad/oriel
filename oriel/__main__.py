@@ -91,7 +91,7 @@ def _model_ready(profile: object, environ: Mapping[str, str] | None = None) -> b
         return False
     try:
         model = OpenAICompatibleStreamingModel(profile, EnvironmentCredentialResolver(environ))
-        next(iter(model.stream(ModelInput((ModelMessage("user", "health"),)), CancellationSignal())))
+        next(iter(model.stream(ModelInput((ModelMessage("user", "Reply with exactly OK."),)), CancellationSignal())))
         return True
     except Exception:
         return False
