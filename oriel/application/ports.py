@@ -2,7 +2,76 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ContextManager, Iterable, Mapping, Protocol
+import re
+from datetime import datetime
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, ContextManager, Iterable, Mapping, Protocol
+
+if TYPE_CHECKING:
+    from ..domain.ha_manifest import FactRequest, CanonicalProposal
+
+
+_UTC_TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+@dataclass(frozen=True)
+class HaWorkerAvailability:
+    """The only HA-worker fact allowed to enter application readiness."""
+
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"ready", "unavailable"}:
+            raise ValueError("invalid HA worker availability")
+
+
+class HaWorkerAvailabilityPort(Protocol):
+    """Reports bounded HA-worker availability without provider material."""
+
+    def availability(self) -> HaWorkerAvailability: ...
+
+
+@dataclass(frozen=True)
+class BoundedHomeFact:
+    """The complete provider-neutral observation allowed out of the HA adapter."""
+
+    power_state: str | None
+    observed_at: str | None
+    freshness: str
+
+    def __post_init__(self) -> None:
+        if self.freshness not in {"fresh", "stale", "unavailable"}:
+            raise ValueError("invalid fact freshness")
+        if self.freshness == "unavailable":
+            if self.power_state is not None or self.observed_at is not None:
+                raise ValueError("unavailable facts carry no observation")
+        elif self.power_state not in {"on", "off"} or not isinstance(self.observed_at, str) or _UTC_TIMESTAMP.fullmatch(self.observed_at) is None or not _valid_utc_timestamp(self.observed_at):
+            raise ValueError("observed facts require bounded state and time")
+
+    def payload(self) -> Mapping[str, str | None]:
+        return MappingProxyType({
+            "power_state": self.power_state,
+            "observed_at": self.observed_at,
+            "freshness": self.freshness,
+        })
+
+    @classmethod
+    def unavailable(cls) -> "BoundedHomeFact":
+        return cls(None, None, "unavailable")
+
+
+def _valid_utc_timestamp(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+class HomeFactReaderPort(Protocol):
+    """Reads one already-admitted fact without exposing provider material."""
+
+    def read(self, request: "FactRequest") -> BoundedHomeFact: ...
 
 
 class ModelPort(Protocol):
@@ -109,6 +178,24 @@ class MonotonicClock(Protocol):
     def monotonic(self) -> float: ...
 
 
+class ScheduledCall(Protocol):
+    """Allows application lifecycle code to retract a scheduled callback."""
+
+    def cancel(self) -> None: ...
+
+
+class SchedulerPort(Protocol):
+    """Schedules application-owned callbacks without choosing timer infrastructure."""
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> ScheduledCall: ...
+
+
+class BackgroundTaskPort(Protocol):
+    """Runs provider work outside the stream-event serialization loop."""
+
+    def start(self, callback: Callable[[], None]) -> None: ...
+
+
 class StatePort(Protocol):
     """Records a completed internal turn without defining persistence."""
 
@@ -138,11 +225,11 @@ class RequestLedgerPort(Protocol):
 
     def reserve(self, record: RequestStatusRecord) -> None: ...
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None: ...
+    def mark_terminal(self, request_id: str, outcome: str) -> str: ...
 
     def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None: ...
 
-    def recover_interrupted(self) -> None: ...
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None: ...
 
 
 class TelemetryPort(Protocol):
@@ -177,3 +264,166 @@ class ToolPort(Protocol):
     """A future tool seam. Bootstrap adapters must deny every dispatch."""
 
     def dispatch(self, name: str, arguments: Mapping[str, str]) -> None: ...
+
+
+@dataclass(frozen=True)
+class DryRunPreview:
+    """The bounded result of an independently validated synthetic preview."""
+
+    status: str
+    operation: str | None
+    target: str | None
+    desired_state: str | None
+    manifest_revision: str | None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"simulated", "denied", "unavailable"}:
+            raise ValueError("invalid dry-run status")
+        complete = (self.operation, self.target, self.desired_state, self.manifest_revision)
+        if self.status == "simulated":
+            if not all(isinstance(value, str) and value for value in complete) or self.desired_state not in {"on", "off"} or self.reason is not None:
+                raise ValueError("invalid simulated dry-run")
+        elif any(value is not None for value in complete):
+            raise ValueError("invalid failed dry-run")
+        elif self.status == "denied" and self.reason != "adapter_rejected":
+            raise ValueError("invalid denied dry-run")
+        elif self.status == "unavailable" and self.reason != "adapter_unavailable":
+            raise ValueError("invalid unavailable dry-run")
+
+
+class DryRunPreviewPort(Protocol):
+    """Independently validates and simulates one already-canonical proposal."""
+
+    def preview(self, proposal: object) -> DryRunPreview: ...
+
+
+EXECUTION_REASONS = frozenset({"observation_confirmed", "prerequisite_unmet", "adapter_rejected", "service_rejected", "no_effect_failure", "transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"})
+
+
+@dataclass(frozen=True)
+class ActionExecutionResult:
+    """Closed evidence, suitable for durable storage and public reporting."""
+    status: str
+    reason: str
+    evidence: str = "none"
+    power_state: str | None = None
+    observed_at: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"confirmed", "denied", "failed", "outcome_unknown"} or self.reason not in EXECUTION_REASONS or self.evidence not in {"none", "accepted", "observed"}:
+            raise ValueError("invalid execution result")
+        if self.evidence == "observed":
+            BoundedHomeFact(self.power_state, self.observed_at, "fresh")
+        elif self.power_state is not None or self.observed_at is not None:
+            raise ValueError("unexpected execution observation")
+        allowed = {"confirmed": {"observation_confirmed"}, "denied": {"prerequisite_unmet", "adapter_rejected", "service_rejected"}, "failed": {"no_effect_failure"}, "outcome_unknown": {"transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"}}
+        if self.reason not in allowed[self.status] or (self.status == "confirmed" and self.evidence != "observed") or (self.status in {"denied", "failed"} and self.evidence != "none"):
+            raise ValueError("inconsistent execution evidence")
+
+    def payload(self) -> dict[str, object]:
+        return {"status": self.status, "reason": self.reason, "evidence": self.evidence,
+                "power_state": self.power_state, "observed_at": self.observed_at}
+
+
+@dataclass(frozen=True)
+class ActionExecutionRequest:
+    proposal: "CanonicalProposal"
+    deadline: float
+
+
+class ActionExecutionPort(Protocol):
+    def execute(self, request: ActionExecutionRequest) -> ActionExecutionResult: ...
+
+
+@dataclass(frozen=True)
+class ActionRecord:
+    """Payload-free durable state for one server-owned synthetic action."""
+
+    action_id: str
+    request_id: str
+    trace_id: str
+    manifest_revision: str
+    capability_id: str
+    operation_fingerprint: str
+    state: str
+    reserved_at: str
+    updated_at: str
+    result: ActionExecutionResult | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}:
+            raise ValueError("invalid action record state")
+        if not all(isinstance(value, str) and value for value in (
+            self.action_id, self.request_id, self.trace_id, self.manifest_revision,
+            self.capability_id, self.operation_fingerprint, self.reserved_at, self.updated_at,
+        )):
+            raise ValueError("invalid action record")
+
+
+@dataclass(frozen=True)
+class ActionReservation:
+    """The closed outcome of atomically reserving a synthetic action."""
+
+    status: str
+    record: ActionRecord
+
+    def __post_init__(self) -> None:
+        if self.status not in {"reserved", "duplicate", "conflict"}:
+            raise ValueError("invalid action reservation status")
+
+
+@dataclass(frozen=True)
+class ActionReadiness:
+    """Whether action recording can still make authoritative safety claims."""
+
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"ready", "degraded"}:
+            raise ValueError("invalid action readiness")
+
+
+class ActionLedgerUnavailable(RuntimeError):
+    """A durable action-ledger operation could not be completed."""
+
+
+class ActionLedgerPort(Protocol):
+    """Separates action reservation/audit from request lifecycle storage."""
+
+    def reserve_and_audit(self, record: ActionRecord) -> ActionReservation: ...
+
+    def mark_execution_result(self, action_id: str, occurred_at: str, result: ActionExecutionResult) -> ActionRecord: ...
+
+    def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord: ...
+
+    def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord: ...
+
+    def recover_unresolved(self, occurred_at: str) -> None: ...
+
+    def committed_request_ids(self) -> tuple[str, ...]: ...
+
+    def readiness(self) -> ActionReadiness: ...
+
+    def degrade(self) -> None: ...
+
+
+class FakeActionDispatchPort(Protocol):
+    """A test-only, provider-free seam for one already-reserved fake attempt."""
+
+    def attempt(self, action: ActionRecord) -> None: ...
+
+
+@dataclass(frozen=True)
+class ActionPolicyConfiguration:
+    """Immutable operator policy evidence attached to proposal validation."""
+
+    revision: int
+    restrictions: Mapping[str, object] | None
+    disabled: bool
+
+
+class ActionPolicyPort(Protocol):
+    def action_policy(self) -> ActionPolicyConfiguration: ...
+
+    def synchronized_by(self, synchronization: SynchronizationPort) -> bool: ...

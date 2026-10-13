@@ -51,6 +51,29 @@ class SQLiteRequestLedgerTests(unittest.TestCase):
             ledger.mark_terminal("request-1", "failed")
             self.assertIsNone(ledger.lookup("request-1", "2026-09-27T10:00:01Z"))
 
+    def test_recovered_unknown_is_monotonic_across_stale_callbacks_and_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ledger.sqlite3"
+            ledger = SQLiteRequestLedger(path)
+            ledger.reserve(record())
+            ledger.recover_interrupted(("request-1",))
+            ledger.close()
+            ledger = SQLiteRequestLedger(path)
+            self.addCleanup(ledger.close)
+            for outcome in ("completed", "cancelled", "failed", "denied"):
+                self.assertEqual(ledger.mark_terminal("request-1", outcome), "outcome_unknown")
+            ledger.recover_interrupted()
+            self.assertEqual(ledger.lookup("request-1", "2026-09-26T11:00:00Z").outcome, "outcome_unknown")
+
+    def test_recovery_with_committed_action_preserves_already_terminal_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = SQLiteRequestLedger(Path(directory) / "ledger.sqlite3")
+            self.addCleanup(ledger.close)
+            ledger.reserve(record())
+            ledger.mark_terminal("request-1", "cancelled")
+            ledger.recover_interrupted(("request-1",))
+            self.assertEqual(ledger.lookup("request-1", "2026-09-26T11:00:00Z").outcome, "cancelled")
+
     def test_one_active_owner_and_canonical_utc_timestamps_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "ledger.sqlite3"

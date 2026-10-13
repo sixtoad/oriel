@@ -12,11 +12,15 @@ from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import urlparse
 
 from ..application.configuration import ActivationResult, ActivationSucceeded, ConfigurationService
+from ..application.ports import HaWorkerAvailability, HaWorkerAvailabilityPort, HomeFactReaderPort
+from .ha_facts import SyntheticHaFactReader
 from ..application.startup import MODEL_UNREADY_CODE, StartupState, UNREADY_CODE
 from ..domain.configuration import ConfigError, parse_core_config
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("fake-model.json")
 PROBE_TIMEOUT_SECONDS = 5.0
+HA_WORKER_CHANNEL_ENV = "ORIEL_HA_WORKER_CHANNEL"
+MAX_HA_WORKER_CHANNEL_CHARACTERS = 96
 
 
 class ProfileUnavailable(ValueError):
@@ -101,6 +105,23 @@ def select_provider_profiles_path(environ: Mapping[str, str] | None = None) -> P
     source = os.environ if environ is None else environ
     value = source.get("ORIEL_PROVIDER_PROFILES_PATH")
     return None if value is None else Path(value)
+
+
+def select_ha_worker_channel(environ: Mapping[str, str] | None = None) -> Path | None:
+    """Select the adapter-private local worker channel without exposing it."""
+    source = os.environ if environ is None else environ
+    value = source.get(HA_WORKER_CHANNEL_ENV)
+    if not isinstance(value, str) or not value or len(value) > MAX_HA_WORKER_CHANNEL_CHARACTERS:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or "\x00" in value:
+        return None
+    return path
+
+
+def synthetic_ha_fact_reader(optional_ha_state: str, fixture: str = "fresh") -> HomeFactReaderPort:
+    """Compose the fixture reader from only the bounded optional-HA state."""
+    return SyntheticHaFactReader(lambda: optional_ha_state == "ready", fixture)
 
 
 def provider_profile_resolver(environ: Mapping[str, str] | None = None) -> ProviderProfileResolver:
@@ -206,6 +227,7 @@ def activate_startup(
     default_path: Path = DEFAULT_CONFIG_PATH,
     model_probe: Callable[[ProviderProfile], bool] | None = None,
     optional_ha_probe: Callable[[], bool] | None = None,
+    optional_ha_worker: HaWorkerAvailabilityPort | None = None,
     probe_timeout_seconds: float = PROBE_TIMEOUT_SECONDS,
 ) -> tuple[StartupState, ProviderProfile | None]:
     """Select, validate, resolve, and atomically activate one startup document.
@@ -231,7 +253,9 @@ def activate_startup(
     if model_ready and model_probe is not None:
         model_ready = _bounded_probe(model_probe, active_profile, probe_timeout_seconds)
     optional_ha_state = "disabled"
-    if optional_ha_probe is not None:
+    if optional_ha_worker is not None:
+        optional_ha_state = "ready" if _bounded_ha_probe(optional_ha_worker, probe_timeout_seconds) else "degraded"
+    elif optional_ha_probe is not None:
         optional_ha_state = "ready" if _bounded_probe(optional_ha_probe, None, probe_timeout_seconds) else "degraded"
     return _startup_from_result(result, model_ready, optional_ha_state), active_profile
 
@@ -262,3 +286,23 @@ def _bounded_probe(probe: Callable[..., bool], profile: ProviderProfile | None, 
     except RuntimeError:
         return False
     return completed.wait(max(0.0, timeout_seconds)) and result == [True]
+
+
+def _bounded_ha_probe(worker: HaWorkerAvailabilityPort, timeout_seconds: float) -> bool:
+    """Reduce every worker outcome to the one safe optional-dependency state."""
+    completed = Event()
+    result: list[HaWorkerAvailability] = []
+
+    def run() -> None:
+        try:
+            result.append(worker.availability())
+        except Exception:
+            result.append(HaWorkerAvailability("unavailable"))
+        finally:
+            completed.set()
+
+    try:
+        Thread(target=run, daemon=True).start()
+    except RuntimeError:
+        return False
+    return completed.wait(max(0.0, timeout_seconds)) and result == [HaWorkerAvailability("ready")]

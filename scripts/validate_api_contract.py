@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import math
 import re
@@ -14,7 +15,7 @@ LIMITS = {"input_bytes": 16384, "context_messages": 32, "context_bytes": 65536,
           "open_sessions": 10, "active_turns": 2, "queue_depth": 8,
           "model_deadline_seconds": 30, "streamed_content_bytes": 65536,
           "event_data_bytes": 8192}
-EVENTS = frozenset(("accepted", "ack", "content_delta", "proposal", "validation",
+EVENTS = frozenset(("accepted", "ack", "content_delta", "proposal", "fact", "validation",
                     "action_state", "error", "terminal"))
 OUTCOMES = frozenset(("completed", "denied", "failed", "cancelled", "outcome_unknown"))
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
@@ -24,11 +25,12 @@ FIXTURES = {
     "valid": {"accepted-error-categories": "accepted_error_categories", "accepted-failure": "accepted_failure", "accepted-stream": "accepted_stream",
               "cancelled-stream": "cancelled_stream", "caps": "caps",
               "cancellation-race": "cancellation_race", "config-precedence": "config_precedence", "extension": "extension_event",
+              "home-fact-stream": "home_fact_stream",
               "generic-action": "generic_action", "invalid-optional-skill": "invalid_optional_skill",
-              "passive-status": "passive_status", "preaccept-errors": "preaccept_errors"},
+              "execution-confirmed": "execution_confirmed", "execution-unknown": "execution_unknown", "action-reservation": "action_reservation", "cancelled-action-known": "cancelled_action_known", "cancelled-action-unknown": "cancelled_action_unknown", "passive-status": "passive_status", "preaccept-errors": "preaccept_errors", "simulated-preview": "simulated_preview"},
     "invalid": {"ack-after-content": "ack_after_content", "cap-overflow": "cap_overflow",
                 "cancellation-outcome": "cancellation_outcome", "out-of-order-sequence": "invalid_sequence", "passive-status-outcome": "passive_status_outcome", "post-terminal": "post_terminal",
-                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field"},
+                "unknown-config-field": "unknown_config_field", "unknown-manifest-field": "unknown_manifest_field", "invalid-preview": "invalid_preview", "invalid-action-state": "invalid_action_state", "cancelled-action-hidden": "cancelled_action_hidden", "cancelled-action-content": "cancelled_action_content", "cancelled-action-repeat": "cancelled_action_repeat"},
 }
 FIXTURE_NAMES = frozenset(name for group in FIXTURES.values() for name in group.values())
 
@@ -136,14 +138,26 @@ def _error(value, path, errors):
         errors.append(path + ".error.action_outcome: invalid action outcome")
 
 
-def validate_stream(events, path="events"):
+def validate_stream(events, path="events", cancellation_after_seq=None):
     errors = []
     if type(events) is not list or not events:
         return [f"{path}: expected nonempty event array"]
+    if cancellation_after_seq is not None and (type(cancellation_after_seq) is not int or cancellation_after_seq < 1):
+        return [f"{path}: invalid cancellation acknowledgement boundary"]
+    if cancellation_after_seq is not None:
+        boundary = next((event for event in events if isinstance(event, dict) and event.get("seq") == cancellation_after_seq), None)
+        terminal_sequences = [event.get("seq") for event in events if isinstance(event, dict) and event.get("type") == "terminal" and type(event.get("seq")) is int]
+        if boundary is None or boundary.get("type") == "terminal" or not terminal_sequences or cancellation_after_seq >= min(terminal_sequences):
+            errors.append(path + ": cancellation boundary must identify an event before terminal")
+    late_cancellation_errors = 0
     request = session = trace = generation = None
     seq = 0
     acked = useful = terminal = False
     streamed_content_bytes = 0
+    preview_proposal = None
+    action_id = action_state = None
+    action_conflict = False
+    action_evidence_count = 0
     for index, event in enumerate(events):
         loc = f"{path}[{index}]"
         if not _keys(event, ("api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq"), loc, errors, allow_extra=True):
@@ -169,6 +183,19 @@ def validate_stream(events, path="events"):
             request, session, trace, generation = (event["request_id"], event["session_id"], event["trace_id"], event["context_generation"])
         elif (event["request_id"], event["session_id"], event["trace_id"], event["context_generation"]) != (request, session, trace, generation):
             errors.append(loc + ": event identity or context generation changed")
+        if cancellation_after_seq is not None and type(event["seq"]) is int and event["seq"] > cancellation_after_seq:
+            if kind == "error":
+                late_cancellation_errors += 1
+                error = event.get("error")
+                if late_cancellation_errors > 1 or not isinstance(error, dict) or error.get("category") != "cancellation":
+                    errors.append(loc + ": at most one typed cancellation error may follow acknowledgement")
+                elif any(error.get(key) != event[key] for key in ("request_id", "session_id", "trace_id")):
+                    errors.append(loc + ": cancellation error must match stream identity")
+            if kind in {"ack", "content_delta", "proposal", "fact", "validation"}:
+                errors.append(loc + ": generated output after cancellation acknowledgement")
+            if kind == "action_state" and (not isinstance(event.get("action_state"), dict) or event["action_state"].get("state") not in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}
+                    or not all(isinstance(event["action_state"].get(key), str) and event["action_state"][key] for key in ("action_id", "request_id", "trace_id"))):
+                errors.append(loc + ": only committed action evidence survives cancellation")
         if kind == "ack":
             if acked:
                 errors.append(loc + ".type: ack may occur at most once")
@@ -176,8 +203,14 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".type: ack must precede useful content")
             if "outcome" in event:
                 errors.append(loc + ".outcome: ack cannot state completion or approval")
+            if event.get("message") != "Work is continuing.":
+                errors.append(loc + ".message: ack requires the fixed bounded message")
+            for field in set(event) - {"api_version", "type", "request_id", "session_id", "trace_id", "context_generation", "seq", "message"}:
+                errors.append(loc + f".{field}: ack may only carry its fixed message")
             acked = True
-        if kind in ("content_delta", "proposal", "validation", "action_state"):
+        elif "message" in event:
+            errors.append(loc + ".message: only ack may carry a message")
+        if kind in ("content_delta", "proposal", "fact", "validation", "action_state"):
             useful = True
         if kind == "content_delta":
             if type(event.get("content")) is not str:
@@ -191,6 +224,54 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".proposal: proposal event requires proposal")
             else:
                 _validate_proposal(event["proposal"], loc + ".proposal", errors)
+                preview_proposal = event["proposal"] if _is_ha_material(event["proposal"]) else None
+        if kind == "validation":
+            if "preview" not in event:
+                errors.append(loc + ".preview: validation requires preview")
+            else:
+                _validate_preview(event["preview"], loc + ".preview", errors)
+                preview = event["preview"]
+                if type(preview) is dict and preview.get("status") == "simulated":
+                    material = {key: preview.get(key) for key in ("operation", "target", "arguments", "manifest_revision")}
+                    if preview_proposal is None or material != preview_proposal:
+                        errors.append(loc + ".preview: simulated preview must follow its identical harmless-light proposal")
+                preview_proposal = None
+        elif "preview" in event:
+            errors.append(loc + ".preview: only validation may carry preview")
+        if kind != "fact" and "fact" in event:
+            errors.append(loc + ".fact: only fact events may carry a fact")
+        if kind == "fact":
+            _validate_fact(event.get("fact"), loc + ".fact", errors)
+        if kind == "action_state":
+            if "action_state" not in event:
+                errors.append(loc + ".action_state: action_state event requires payload")
+            else:
+                _validate_action_state(event["action_state"], loc + ".action_state", errors)
+                for key in ("content", "proposal", "preview", "error", "outcome"):
+                    if key in event:
+                        errors.append(loc + "." + key + ": action_state may not carry other payload")
+                state = event["action_state"]
+                if type(state) is dict and (state.get("state") != "denied" or "action_id" in state):
+                    action_evidence_count += 1
+                    if action_evidence_count > 2:
+                        errors.append(loc + ": action evidence exceeds bounded commitment/result pair")
+                    if action_id is not None and state.get("action_id") != action_id:
+                        errors.append(loc + ": action identity changed")
+                    next_state = state.get("state")
+                    if action_state is None and next_state in {"fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}:
+                        errors.append(loc + ": action result requires prior reservation")
+                    if action_state is not None and (action_state != "reserved" or next_state not in {"fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}):
+                        errors.append(loc + ": action evidence regressed or repeated")
+                    action_id = state.get("action_id")
+                    action_state = state.get("existing_state") if next_state in {"duplicate", "conflict"} else next_state
+                    action_conflict = next_state == "conflict"
+                    for key in ("request_id", "trace_id"):
+                        if state.get(key) != event[key]:
+                            errors.append(loc + ".action_state." + key + ": must match stream identity")
+                elif type(state) is dict and state.get("state") == "denied":
+                    action_state = "denied"
+        elif "action_state" in event:
+            errors.append(loc + ".action_state: only action_state may carry action state")
         if kind == "error":
             if "error" not in event:
                 errors.append(loc + ".error: error event requires error")
@@ -200,6 +281,11 @@ def validate_stream(events, path="events"):
                 errors.append(loc + ".outcome: terminal requires outcome")
             if event.get("outcome") not in OUTCOMES:
                 errors.append(loc + ".outcome: invalid terminal outcome")
+            if action_state in {"reserved", "outcome_unknown"} and event.get("outcome") != "outcome_unknown":
+                errors.append(loc + ": unresolved commitment requires outcome_unknown")
+            expected_outcome = "denied" if action_conflict else {"confirmed": "completed", "denied": "denied", "failed": "failed"}.get(action_state)
+            if expected_outcome is not None and event.get("outcome") not in {expected_outcome, "cancelled", "outcome_unknown"}:
+                errors.append(loc + ": terminal contradicts known action evidence")
             terminal = True
         event_bytes = len(json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
         if event_bytes > LIMITS["event_data_bytes"]:
@@ -207,6 +293,33 @@ def validate_stream(events, path="events"):
     if not terminal:
         errors.append(path + ": exactly one terminal event is required")
     return errors
+
+
+def _validate_fact(fact, path, errors):
+    if not _keys(fact, ("power_state", "observed_at", "freshness"), path, errors):
+        return
+    freshness = fact["freshness"]
+    if freshness not in ("fresh", "stale", "unavailable"):
+        errors.append(path + ".freshness: invalid freshness")
+        return
+    if freshness == "unavailable":
+        if fact["power_state"] is not None or fact["observed_at"] is not None:
+            errors.append(path + ": unavailable fact must carry no observation")
+        return
+    if fact["power_state"] not in ("on", "off"):
+        errors.append(path + ".power_state: expected observed power state")
+    if not _utc_observation(fact["observed_at"]):
+        errors.append(path + ".observed_at: expected UTC observation time")
+
+
+def _utc_observation(value):
+    if not (type(value) is str and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value)):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def _validate_config(config, path, errors, disabled_skills=None):
@@ -245,6 +358,9 @@ def _validate_manifest(manifest, path, errors):
 
 
 def _validate_proposal(proposal, path, errors):
+    if type(proposal) is dict and set(proposal) == {"operation", "target", "arguments", "manifest_revision"}:
+        _validate_ha_material(proposal, path, errors)
+        return
     required = ("proposal_version", "proposal_id", "action", "target", "arguments", "dry_run", "idempotency", "deadline", "confirmation")
     if not _keys(proposal, required, path, errors, optional=("state", "result")): return
     if proposal["proposal_version"] != "1.0": errors.append(path + ".proposal_version: expected 1.0")
@@ -269,6 +385,102 @@ def _validate_proposal(proposal, path, errors):
                 errors.append(path + ".result.state: invalid result state")
             if "detail" in result and not (type(result["detail"]) is str and len(result["detail"]) <= 256):
                 errors.append(path + ".result.detail: expected bounded detail")
+
+
+def _validate_ha_material(value, path, errors):
+    if not _keys(value, ("operation", "target", "arguments", "manifest_revision"), path, errors):
+        return
+    if value["operation"] != "home_assistant.light.set_power.v1": errors.append(path + ".operation: unsupported operation")
+    if value["target"] != "synthetic:reviewed-harmless-light": errors.append(path + ".target: unsupported target")
+    if value["manifest_revision"] != "home_assistant.harmless_light.v1": errors.append(path + ".manifest_revision: unsupported revision")
+    if _keys(value["arguments"], ("desired_state",), path + ".arguments", errors) and value["arguments"]["desired_state"] not in ("on", "off"): errors.append(path + ".arguments.desired_state: invalid desired state")
+
+
+def _is_ha_material(value):
+    return type(value) is dict and set(value) == {"operation", "target", "arguments", "manifest_revision"}
+
+
+def _validate_preview(value, path, errors):
+    if not _keys(value, ("status",), path, errors, optional=("operation", "target", "arguments", "manifest_revision", "reason")):
+        return
+    status = value["status"]
+    if status not in ("simulated", "denied", "unavailable"):
+        errors.append(path + ".status: invalid preview status")
+        return
+    material = {key: value[key] for key in ("operation", "target", "arguments", "manifest_revision") if key in value}
+    if status == "simulated":
+        if "reason" in value:
+            errors.append(path + ".reason: simulated preview has no reason")
+        _validate_ha_material(material, path, errors)
+    else:
+        if material:
+            errors.append(path + ": unavailable or denied preview has no canonical material")
+        expected_reason = "adapter_rejected" if status == "denied" else "adapter_unavailable"
+        if value.get("reason") != expected_reason:
+            errors.append(path + ".reason: invalid preview reason")
+
+
+def _validate_action_state(value, path, errors):
+    if not _keys(value, ("state", "readiness"), path, errors,
+                 optional=("action_id", "request_id", "trace_id", "manifest_revision", "capability_id", "existing_state", "result")):
+        return
+    state = value["state"]
+    if state not in ("reserved", "duplicate", "conflict", "fake_attempted", "outcome_unknown", "denied", "confirmed", "failed"):
+        errors.append(path + ".state: invalid action state")
+        return
+    if value["readiness"] not in ("ready", "degraded"):
+        errors.append(path + ".readiness: invalid readiness")
+    identifiers = ("action_id", "request_id", "trace_id")
+    if state == "denied" and "action_id" not in value:
+        for key in identifiers:
+            if key in value:
+                errors.append(path + "." + key + ": denied action state must not identify an action")
+    else:
+        for key in identifiers:
+            if key not in value:
+                errors.append(path + "." + key + ": action state requires identifier")
+            else:
+                _id(value[key], path + "." + key, errors)
+        if value.get("manifest_revision") != "home_assistant.harmless_light.v1":
+            errors.append(path + ".manifest_revision: unsupported revision")
+        if value.get("capability_id") != "home_assistant.harmless_light":
+            errors.append(path + ".capability_id: unsupported capability")
+    if state in ("duplicate", "conflict"):
+        if value.get("existing_state") not in ("reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"):
+            errors.append(path + ".existing_state: duplicate/conflict requires known state")
+    elif "existing_state" in value:
+        errors.append(path + ".existing_state: only duplicate/conflict may carry existing state")
+
+    result = value.get("result")
+    expected = value.get("existing_state") if state in {"duplicate", "conflict"} else state
+    if expected in {"reserved", "fake_attempted"} and "result" in value:
+        errors.append(path + ": non-result state forbids evidence")
+    if expected in {"confirmed", "failed"} and result is None:
+        errors.append(path + ": execution requires evidence")
+    if "result" in value:
+        _validate_execution_result(result, path + ".result", errors)
+        if type(result) is dict and result.get("status") != expected:
+            errors.append(path + ": result must match state")
+
+
+def _validate_execution_result(value, path, errors):
+    if not _keys(value, ("status", "reason", "evidence", "power_state", "observed_at"), path, errors):
+        return
+    reasons = {"confirmed": {"observation_confirmed"}, "denied": {"prerequisite_unmet", "adapter_rejected", "service_rejected"}, "failed": {"no_effect_failure"}, "outcome_unknown": {"transport_unknown", "deadline", "observation_missing", "observation_stale", "observation_mismatch"}}
+    status, evidence = value["status"], value["evidence"]
+    if not isinstance(status, str) or not isinstance(value["reason"], str) or value["reason"] not in reasons.get(status, set()):
+        errors.append(path + ": invalid execution reason")
+    if evidence not in ("none", "accepted", "observed") or (status == "confirmed" and evidence != "observed") or (status in ("denied", "failed") and evidence != "none"):
+        errors.append(path + ": invalid evidence strength")
+    if evidence == "observed":
+        try:
+            if value["power_state"] not in ("on", "off") or not isinstance(value["observed_at"], str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value["observed_at"]) is None:
+                raise ValueError()
+            datetime.strptime(value["observed_at"], "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            errors.append(path + ": invalid observation")
+    elif value["power_state"] is not None or value["observed_at"] is not None:
+        errors.append(path + ": unexpected observation")
 
 
 def validate_turn(turn, path="turn"):
@@ -337,7 +549,16 @@ def validate_fixture(document):
     fixture = document["fixture"]
     if fixture not in FIXTURE_NAMES:
         errors.append("fixture: unknown fixture name")
-    if "events" in document: errors.extend(validate_stream(document["events"]))
+    combined_cancellation = fixture.startswith("cancelled_action_") or ("events" in document and ("acknowledgements" in document or "cancellation_after_seq" in document))
+    if combined_cancellation:
+        if document.get("cancellation_after_seq") is None:
+            errors.append("cancellation_after_seq: combined fixture requires cancellation boundary")
+        events = document.get("events")
+        request_id = events[0].get("request_id") if isinstance(events, list) and events and isinstance(events[0], dict) else None
+        acknowledgements = document.get("acknowledgements")
+        if not isinstance(acknowledgements, list) or len(acknowledgements) != 1 or not isinstance(acknowledgements[0], dict) or acknowledgements[0].get("state") != "cancellation_requested" or acknowledgements[0].get("request_id") != request_id:
+            errors.append("acknowledgements: combined fixture requires matching live cancellation acknowledgement")
+    if "events" in document: errors.extend(validate_stream(document["events"], cancellation_after_seq=document.get("cancellation_after_seq")))
     if fixture == "accepted_error_categories":
         streams = document.get("streams")
         if type(streams) is not list or len(streams) != 5:
@@ -360,7 +581,7 @@ def validate_fixture(document):
         if type(statuses) is not list or not statuses: errors.append("statuses: expected nonempty array")
         else:
             for index, status in enumerate(statuses): _validate_status(status, f"statuses[{index}]", errors)
-    if fixture in ("cancellation_race", "cancellation_outcome"):
+    if fixture in ("cancellation_race", "cancellation_outcome", "cancelled_action_known", "cancelled_action_unknown", "cancelled_action_hidden", "cancelled_action_content", "cancelled_action_repeat"):
         acknowledgements = document.get("acknowledgements")
         if type(acknowledgements) is not list or not acknowledgements: errors.append("acknowledgements: expected nonempty array")
         else:

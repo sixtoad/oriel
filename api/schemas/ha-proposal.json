@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/ha-proposal.json",
+  "title": "Oriel canonical harmless-light proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "target", "arguments", "manifest_revision"],
+  "properties": {
+    "operation": {"const": "home_assistant.light.set_power.v1"},
+    "target": {"const": "synthetic:reviewed-harmless-light"},
+    "arguments": {"type": "object", "additionalProperties": false, "required": ["desired_state"], "properties": {"desired_state": {"enum": ["on", "off"]}}},
+    "manifest_revision": {"const": "home_assistant.harmless_light.v1"}
+  }
+}

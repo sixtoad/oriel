@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oriel.invalid/api/1.0/schemas/ha-preview.json",
+  "title": "Oriel harmless-light dry-run preview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status"],
+  "properties": {
+    "status": {"enum": ["simulated", "denied", "unavailable"]},
+    "operation": {"const": "home_assistant.light.set_power.v1"},
+    "target": {"const": "synthetic:reviewed-harmless-light"},
+    "arguments": {"type": "object", "additionalProperties": false, "required": ["desired_state"], "properties": {"desired_state": {"enum": ["on", "off"]}}},
+    "manifest_revision": {"const": "home_assistant.harmless_light.v1"},
+    "reason": {"enum": ["adapter_rejected", "adapter_unavailable"]}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "simulated"}}}, "then": {"required": ["operation", "target", "arguments", "manifest_revision"], "not": {"required": ["reason"]}}, "else": {"required": ["reason"], "not": {"anyOf": [{"required": ["operation"]}, {"required": ["target"]}, {"required": ["arguments"]}, {"required": ["manifest_revision"]}]}}},
+    {"if": {"properties": {"status": {"const": "denied"}}}, "then": {"properties": {"reason": {"const": "adapter_rejected"}}}},
+    {"if": {"properties": {"status": {"const": "unavailable"}}}, "then": {"properties": {"reason": {"const": "adapter_unavailable"}}}}
+  ]
+}

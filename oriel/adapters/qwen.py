@@ -9,7 +9,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOperationFailure, ModelOutcome, ModelProposal, ModelStreamItem
-from ..domain.proposals import validate_proposal
 from .configuration import OpenAICompatibleProfile
 
 
@@ -236,7 +235,9 @@ class _ToolCall:
 
     def proposal(self) -> Mapping[str, object]:
         value = _strict_json(self.arguments)
-        if not validate_proposal(value):
+        # The application owns admission so generic and typed candidates pass
+        # through one deterministic policy boundary.
+        if not isinstance(value, Mapping):
             raise ProviderStreamFailure("invalid worker proposal")
         return value
 

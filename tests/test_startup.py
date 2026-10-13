@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import subprocess
+import sys
 import tempfile
 import time
 from threading import Barrier, Thread
@@ -8,14 +11,14 @@ import unittest
 from unittest.mock import patch
 
 from oriel.adapters.bootstrap import ThreadSafeSynchronization
-from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path
+from oriel.adapters.configuration import DEFAULT_CONFIG_PATH, OpenAICompatibleProfile, ResolvedProviderProfile, StaticProfileResolver, activate_startup, select_config_path, select_ha_worker_channel
 from oriel.adapters.request_ledger import SQLiteRequestLedger
 from oriel.application.configuration import ActivationConflict, ActivationRejected, ActivationSucceeded, ConfigurationService, READY_PROFILE_LABEL
-from oriel.application.ports import RequestStatusRecord
+from oriel.application.ports import ActionLedgerUnavailable, ModelChunk, ModelOutcome, RequestStatusRecord
 from oriel.application.startup import UNREADY_CODE
 from oriel.application.text_gateway import AdmissionError
 from oriel.domain.configuration import CoreConfig, parse_core_config
-from oriel.__main__ import _compose_startup, main
+from oriel.__main__ import _compose_startup, _ha_restrictions, _model_ready, main
 
 
 VALID_CONFIG = '{"api_version":"1.0","provider":{"connection_ref":"fake"},"skills":{}}'
@@ -118,6 +121,24 @@ class StartupTests(unittest.TestCase):
             ):
                 selected = self.write(root, "invalid.json", content)
                 self.assertFalse(canonical_startup(selected, {}, default).ready)
+
+    def test_home_assistant_restrictions_are_immutable_and_invalid_expansion_disables_only_that_skill(self):
+        config = parse_core_config({
+            "api_version": "1.0", "provider": {"connection_ref": "fake"},
+            "skills": {"home_assistant": {"enabled": True, "targets": ["synthetic:reviewed-harmless-light"], "read_fields": ["power_state"]}},
+        })
+        self.assertEqual(config.skills["home_assistant"]["targets"], ("synthetic:reviewed-harmless-light",))
+        self.assertEqual(config.skills["home_assistant"]["read_fields"], ("power_state",))
+        restrictions = _ha_restrictions(config)
+        self.assertEqual(dict(restrictions), {"targets": ("synthetic:reviewed-harmless-light",), "read_fields": ("power_state",)})
+        with self.assertRaises(TypeError):
+            restrictions["targets"] = ()  # type: ignore[index]
+        invalid = parse_core_config({
+            "api_version": "1.0", "provider": {"connection_ref": "fake"},
+            "skills": {"home_assistant": {"enabled": True, "targets": ["synthetic:added-target"]}},
+        })
+        self.assertEqual(invalid.disabled_skills, ("home_assistant",))
+        self.assertEqual(dict(invalid.skills), {})
 
     def test_invalid_optional_skill_is_disabled_without_unready_core(self):
         config = parse_core_config(
@@ -297,6 +318,93 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(model_up.ready)
         self.assertEqual(model_up.components["ha"], {"state": "ready"})
 
+    def test_main_composes_a_ready_optional_ha_fact_reader(self):
+        class CapturingServer:
+            instance = None
+
+            def __init__(self, startup, gateway, host, port):
+                del host, port
+                self.startup = startup
+                self.gateway = gateway
+                CapturingServer.instance = self
+
+            def serve_forever(self):
+                self.events = list(self.gateway.begin_turn(self.gateway.create_session().session_id, {"input": "What is the reviewed harmless light status?"}, self.startup))
+
+            def close(self):
+                return None
+
+        startup, profile = _compose_startup(optional_ha_probe=lambda: True)
+        with tempfile.TemporaryDirectory() as directory, patch("oriel.__main__._compose_startup", return_value=(startup, profile)), patch("oriel.__main__.HealthServer", CapturingServer):
+            self.assertEqual(main(["--ledger", str(Path(directory) / "ledger.sqlite3")]), 0)
+        self.assertEqual(CapturingServer.instance.events[1].fact, {"power_state": "off", "observed_at": "2026-10-05T00:00:00Z", "freshness": "fresh"})
+
+    def test_main_recovers_both_ledgers_before_serving_without_replay(self):
+        crash = "from tests.test_action_fences import crash_gateway; import sys; crash_gateway(sys.argv[1], sys.argv[2])"
+        reopen = """
+import json, sys
+from pathlib import Path
+from unittest.mock import patch
+from oriel.__main__ import main
+from tests.test_action_fences import Clock, NOW
+p = Path(sys.argv[1]); expected = sys.argv[2]
+request_id = (p / "request-id").read_text()
+class InspectServer:
+    def __init__(self, startup, gateway, host, port):
+        self.gateway = gateway
+        self.status = gateway.request_status(request_id)
+        assert self.status["outcome"] == expected, self.status
+        assert self.status["state"] == "terminal"
+        assert not gateway._requests
+        assert gateway._fake_action_dispatch is None
+    def serve_forever(self):
+        print(json.dumps(self.gateway.request_status(request_id)))
+    def close(self): pass
+with patch("oriel.__main__.HealthServer", InspectServer), patch("oriel.__main__.RuntimeClock", side_effect=lambda: Clock(NOW)):
+    assert main(["--ledger", str(p / "requests.db"), "--action-ledger", str(p / "actions.db")]) == 0
+"""
+        for boundary in ("before", "reserved", "attempt", "persisted", "recovery"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                crashed = subprocess.run([sys.executable, "-c", crash, directory, boundary], capture_output=True)
+                self.assertEqual(crashed.returncode, 23, crashed.stderr)
+                counter = Path(directory) / "attempts"
+                attempts = counter.read_text() if counter.exists() else ""
+                self.assertEqual(attempts.count("attempt"), int(boundary in {"attempt", "persisted"}))
+                expected = "failed" if boundary == "before" else "outcome_unknown"
+                for _ in range(2):
+                    result = subprocess.run([sys.executable, "-c", reopen, directory, expected], capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["outcome"], expected)
+                    self.assertEqual(counter.read_text() if counter.exists() else "", attempts)
+
+    def test_action_recovery_failure_blocks_admission_before_request_reconciliation(self):
+        class CapturingServer:
+            def __init__(self, startup, gateway, host, port):
+                self.startup, self.gateway = startup, gateway
+            def serve_forever(inner):
+                with self.assertRaises(AdmissionError):
+                    inner.gateway.begin_turn(inner.gateway.create_session().session_id, {"input": "hello"}, inner.startup)
+            def close(self): pass
+        startup, profile = _compose_startup()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.db"
+            ledger = SQLiteRequestLedger(path)
+            ledger.reserve(RequestStatusRecord("request-1", "session-1", "trace-1", 0, "in_progress", None, "2026-10-07T00:00:00Z", "2026-10-09T00:00:00Z"))
+            ledger.close()
+            with patch("oriel.__main__._compose_startup", return_value=(startup, profile)), patch("oriel.__main__.SQLiteActionLedger", side_effect=ActionLedgerUnavailable()), patch("oriel.__main__.HealthServer", CapturingServer):
+                self.assertEqual(main(["--ledger", str(path)]), 0)
+            ledger = SQLiteRequestLedger(path)
+            self.addCleanup(ledger.close)
+            self.assertEqual(ledger.lookup("request-1", "2026-10-08T00:00:00Z").state, "in_progress")
+
+    def test_ha_worker_channel_selection_reads_only_its_non_secret_private_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            channel = Path(directory) / "worker.sock"
+            selected = select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": str(channel), "ORIEL_HA_WORKER_CONNECTION_REF": "CANARY"})
+        self.assertEqual(selected, channel)
+        self.assertIsNone(select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": "relative.sock"}))
+        self.assertIsNone(select_ha_worker_channel({"ORIEL_HA_WORKER_CHANNEL": "\x00invalid"}))
+
     def test_blocked_probe_makes_startup_unready_without_delaying_liveness(self):
         with tempfile.TemporaryDirectory() as directory:
             config = self.write(Path(directory), "config.json", VALID_CONFIG)
@@ -310,6 +418,19 @@ class StartupTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 0.25)
         self.assertFalse(state.ready)
+
+    def test_model_readiness_requires_nonempty_text_chunk(self):
+        profile = OpenAICompatibleProfile("http://private.invalid/stream", "revision", 1)
+        cases = (
+            ((), False),
+            ((ModelOutcome("completed"),), False),
+            ((ModelChunk("  "), ModelOutcome("completed")), False),
+            ((ModelChunk("OK"), ModelOutcome("completed")), True),
+        )
+        for items, expected in cases:
+            with self.subTest(items=items), patch("oriel.__main__.OpenAICompatibleStreamingModel") as model:
+                model.return_value.stream.return_value = iter(items)
+                self.assertIs(_model_ready(profile, {}), expected)
 
     def test_profile_resolution_is_selected_at_restart_not_live_rewired(self):
         with tempfile.TemporaryDirectory() as directory:

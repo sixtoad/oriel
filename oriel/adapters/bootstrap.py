@@ -3,11 +3,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import secrets
-from threading import Condition, Event, Lock, RLock, Thread
+from threading import Condition, Event, Lock, RLock, Thread, Timer as ThreadingTimer
 import time
 from typing import Callable, Iterable, Mapping
 
-from ..application.ports import CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
+from ..application.ports import ActionReadiness, ActionRecord, ActionReservation, CancellationSignal, ModelChunk, ModelInput, ModelOutcome, ModelStreamItem, RequestLedgerUnavailable, RequestStatusRecord
+
+
+class ThreadingScheduler:
+    """Production scheduler for application-owned lifecycle callbacks."""
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> ThreadingTimer:
+        timer = ThreadingTimer(max(0.0, delay_seconds), callback)
+        timer.daemon = True
+        timer.start()
+        return timer
+
+
+class ThreadingTasks:
+    """Production task runner for a blocking provider stream."""
+
+    def start(self, callback: Callable[[], None]) -> None:
+        Thread(target=callback, daemon=True).start()
+
+
+class DeterministicScheduler:
+    """Manually advanced scheduler used with deterministic clocks in focused tests."""
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+        self._calls: list[tuple[float, Callable[[], None], _DeterministicCall]] = []
+
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> "_DeterministicCall":
+        call = _DeterministicCall()
+        self._calls.append((self.seconds + max(0.0, delay_seconds), callback, call))
+        return call
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+        due = [entry for entry in self._calls if entry[0] <= self.seconds]
+        self._calls = [entry for entry in self._calls if entry[0] > self.seconds]
+        for _deadline, callback, call in due:
+            if not call.cancelled:
+                callback()
+
+
+@dataclass
+class _DeterministicCall:
+    cancelled: bool = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
 
 @dataclass(frozen=True)
@@ -178,12 +224,16 @@ class InMemoryRequestLedger:
     def reserve(self, record: RequestStatusRecord) -> None:
         self.records[record.request_id] = record
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None:
+    def mark_terminal(self, request_id: str, outcome: str) -> str:
         record = self.records[request_id]
+        if record.state == "terminal":
+            return record.outcome
         self.records[request_id] = RequestStatusRecord(
             record.request_id, record.session_id, record.trace_id, record.context_generation,
             "terminal", outcome, record.admitted_at, record.expires_at,
         )
+
+        return outcome
 
     def lookup(self, request_id: str, now: str) -> RequestStatusRecord | None:
         record = self.records.get(request_id)
@@ -192,9 +242,11 @@ class InMemoryRequestLedger:
             return None
         return record
 
-    def recover_interrupted(self) -> None:
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None:
         for request_id, record in tuple(self.records.items()):
-            if record.state == "in_progress":
+            if request_id in committed_request_ids and record.state == "in_progress":
+                self.records[request_id] = RequestStatusRecord(record.request_id, record.session_id, record.trace_id, record.context_generation, "terminal", "outcome_unknown", record.admitted_at, record.expires_at)
+            elif record.state == "in_progress":
                 self.mark_terminal(request_id, "failed")
 
 
@@ -205,7 +257,7 @@ class UnavailableRequestLedger:
         del record
         raise RequestLedgerUnavailable()
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None:
+    def mark_terminal(self, request_id: str, outcome: str) -> str:
         del request_id, outcome
         raise RequestLedgerUnavailable()
 
@@ -213,8 +265,88 @@ class UnavailableRequestLedger:
         del request_id, now
         raise RequestLedgerUnavailable()
 
-    def recover_interrupted(self) -> None:
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None:
         raise RequestLedgerUnavailable()
+
+
+@dataclass
+class InMemoryActionLedger:
+    """Payload-free deterministic action ledger for focused tests only."""
+
+    records: dict[str, ActionRecord] = field(default_factory=dict)
+    audit: list[tuple[str, str, str]] = field(default_factory=list)
+    fail_reservation: bool = False
+    fail_result_write: bool = False
+    _degraded: bool = False
+
+    def reserve_and_audit(self, record: ActionRecord) -> ActionReservation:
+        if self.fail_reservation:
+            from ..application.ports import ActionLedgerUnavailable
+            raise ActionLedgerUnavailable()
+        existing = self.records.get(record.request_id)
+        if existing is not None:
+            return ActionReservation("duplicate" if existing.operation_fingerprint == record.operation_fingerprint else "conflict", existing)
+        if self._degraded:
+            from ..application.ports import ActionLedgerUnavailable
+            raise ActionLedgerUnavailable()
+        self.records[record.request_id] = record
+        self.audit.append((record.action_id, "reserved", record.reserved_at))
+        return ActionReservation("reserved", record)
+
+    def mark_execution_result(self, action_id, occurred_at, result):
+        from dataclasses import replace
+        existing = next((record for record in self.records.values() if record.action_id == action_id), None)
+        if existing is not None and existing.state != "reserved":
+            return existing
+        updated = self._transition(action_id, occurred_at, result.status)
+        if updated.state == result.status:
+            updated = replace(updated, result=result)
+            self.records[updated.request_id] = updated
+        return updated
+
+    def mark_fake_attempt(self, action_id: str, occurred_at: str) -> ActionRecord:
+        return self._transition(action_id, occurred_at, "fake_attempted")
+
+    def mark_outcome_unknown(self, action_id: str, occurred_at: str) -> ActionRecord:
+        existing = next((record for record in self.records.values() if record.action_id == action_id), None)
+        if existing is not None and existing.state in {"confirmed", "denied", "failed"}:
+            return existing
+        return self._transition(action_id, occurred_at, "outcome_unknown")
+
+    def recover_unresolved(self, occurred_at: str) -> None:
+        for record in tuple(self.records.values()):
+            if record.state == "reserved":
+                self.mark_outcome_unknown(record.action_id, occurred_at)
+
+    def committed_request_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(record.request_id for record in self.records.values()))
+
+    def readiness(self) -> ActionReadiness:
+        return ActionReadiness("degraded" if self._degraded else "ready")
+
+    def degrade(self) -> None:
+        self._degraded = True
+
+    def _transition(self, action_id: str, occurred_at: str, state: str) -> ActionRecord:
+        from ..application.ports import ActionLedgerUnavailable
+        if self.fail_result_write:
+            self.degrade()
+            raise ActionLedgerUnavailable()
+        for request_id, record in self.records.items():
+            if record.action_id == action_id:
+                if record.state in {state, "outcome_unknown"}:
+                    return record
+                if state == "fake_attempted" and record.state != "reserved":
+                    raise ActionLedgerUnavailable()
+                updated = ActionRecord(
+                    record.action_id, record.request_id, record.trace_id,
+                    record.manifest_revision, record.capability_id,
+                    record.operation_fingerprint, state, record.reserved_at, occurred_at,
+                )
+                self.records[request_id] = updated
+                self.audit.append((action_id, state, occurred_at))
+                return updated
+        raise ActionLedgerUnavailable()
 
 
 @dataclass

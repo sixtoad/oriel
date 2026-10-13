@@ -91,6 +91,13 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(model_unready["code"], "model_unavailable")
         self.assertEqual(model_unready["components"]["ha"], {"state": "disabled"})
 
+    def test_ready_health_exposes_only_the_optional_worker_state(self):
+        config = parse_core_config({"api_version": "1.0", "provider": {"connection_ref": "safe"}, "skills": {}})
+        payload = ready_payload(StartupState(config, None, optional_ha_state="ready"))
+        self.assertEqual(payload["components"]["ha"], {"state": "ready"})
+        self.assertNotIn("channel", str(payload))
+        self.assertNotIn("connection", str(payload))
+
     def test_model_unready_health_is_a_sanitized_503(self):
         config = parse_core_config({"api_version": "1.0", "provider": {"connection_ref": "safe"}, "skills": {}})
         server = self.with_server(StartupState(config, "model_unavailable", model_ready=False, model_code="model_unavailable"))

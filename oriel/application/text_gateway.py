@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Callable, Iterable, Iterator, Mapping
+from types import MappingProxyType
 
 from .fast_router import FastRoute, route as select_fast_route
-from .ports import CancellationSignal, Clock, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, StatePort, SynchronizationPort, TelemetryPort, ToolPort
+from .action_recovery import recover_actions_and_requests
+from .ports import ActionExecutionPort, ActionExecutionRequest, ActionExecutionResult, ActionPolicyPort, ActionLedgerPort, ActionLedgerUnavailable, ActionRecord, BackgroundTaskPort, BoundedHomeFact, HomeFactReaderPort, CancellationSignal, Clock, DryRunPreview, DryRunPreviewPort, FakeActionDispatchPort, IdentifierPort, ModelChunk, ModelInput, ModelMessage, ModelOperationFailure, ModelOutcome, ModelPort, ModelProposal, RequestLedgerPort, RequestLedgerUnavailable, RequestStatusRecord, RouteTelemetry, ScheduledCall, SchedulerPort, StatePort, SynchronizationPort, TelemetryPort, ToolPort
 from .startup import StartupState
 from ..domain.configuration import API_VERSION
+from ..domain.ha_manifest import BUILT_IN_MANIFEST, CAPABILITY_ID, BuiltInManifest, CanonicalProposal, is_ha_fact_candidate, validate_ha_fact_request, is_ha_shaped_candidate, preview_eligibility, execution_eligibility, compute_effective_policy
 from ..domain.proposals import proposal_event_size_is_bounded, validate_proposal
 
 MAX_FAKE_TURN_INPUT_BYTES = 1024
@@ -22,7 +26,14 @@ MAX_STREAM_EVENT_CONTENT_BYTES = 7 * 1024
 MAX_OPEN_SESSIONS = 10
 MAX_ACTIVE_TURNS = 2
 MAX_QUEUED_TURNS = 8
+MAX_PENDING_PROVIDER_ITEMS = 16
 TURN_DEADLINE_SECONDS = 30.0
+ACK_DELAY_SECONDS = 0.5
+ACK_MESSAGE = "Work is continuing."
+_ACK_WAKE = object()
+_PUMP_DONE = object()
+_PUMP_CANCELLED = object()
+_PUMP_DEADLINE = object()
 IDLE_SESSION_SECONDS = 30 * 60
 MAX_SESSION_SECONDS = 24 * 60 * 60
 REQUEST_RETENTION_SECONDS = 24 * 60 * 60
@@ -50,17 +61,29 @@ class StreamEvent:
     trace_id: str
     context_generation: int
     seq: int
+    message: str | None = None
     content: str | None = None
     proposal: Mapping[str, object] | None = None
+    fact: Mapping[str, str | None] | None = None
+    preview: Mapping[str, object] | None = None
+    action_state: Mapping[str, object] | None = None
     error: Mapping[str, object] | None = None
     outcome: str | None = None
 
     def payload(self) -> dict[str, object]:
         payload: dict[str, object] = {"api_version": API_VERSION, "type": self.type, "request_id": self.request_id, "session_id": self.session_id, "trace_id": self.trace_id, "context_generation": self.context_generation, "seq": self.seq}
+        if self.message is not None:
+            payload["message"] = self.message
         if self.content is not None:
             payload["content"] = self.content
         if self.proposal is not None:
             payload["proposal"] = dict(self.proposal)
+        if self.fact is not None:
+            payload["fact"] = dict(self.fact)
+        if self.preview is not None:
+            payload["preview"] = dict(self.preview)
+        if self.action_state is not None:
+            payload["action_state"] = dict(self.action_state)
         if self.error is not None:
             payload["error"] = dict(self.error)
         if self.outcome is not None:
@@ -97,12 +120,23 @@ class _Request:
     queued_start_order: int | None = None
     provider_start_claimed: bool = False
     deadline_at: float = 0.0
+    admitted_monotonic: float = 0.0
+    acknowledgement: ScheduledCall | None = None
+    acknowledgement_pending: bool = False
+    acknowledgement_emitted: bool = False
+    useful_output_emitted: bool = False
+    first_model_token_recorded: bool = False
+    first_useful_content_recorded: bool = False
+    pending_provider_items: deque[object] = field(default_factory=deque)
+    startup_failure: str | None = None
+    validated_policy_revision: tuple[int, int] | None = None
+    committed_action: ActionRecord | None = None
 
 
 class TextGateway:
     """The sole owner of volatile session lifecycle and transcript policy."""
 
-    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS) -> None:
+    def __init__(self, model: ModelPort, clock: Clock, state: StatePort, telemetry: TelemetryPort, tools: ToolPort, identifiers: IdentifierPort, synchronization: SynchronizationPort, ledger: RequestLedgerPort, turn_deadline_seconds: float = TURN_DEADLINE_SECONDS, scheduler: SchedulerPort | None = None, tasks: BackgroundTaskPort | None = None, ha_restrictions: Mapping[str, object] | None = None, ha_manifest: BuiltInManifest = BUILT_IN_MANIFEST, ha_preview: DryRunPreviewPort | None = None, action_ledger: ActionLedgerPort | None = None, fake_action_dispatch: FakeActionDispatchPort | None = None, fact_reader: HomeFactReaderPort | None = None, configuration: ActionPolicyPort | None = None, ha_execution: ActionExecutionPort | None = None) -> None:
         self._model = model
         self._clock = clock
         self._state = state
@@ -116,6 +150,44 @@ class TextGateway:
         self._queued_request_ids: deque[str] = deque()
         self._next_queued_start_order = 0
         self._turn_deadline_seconds = turn_deadline_seconds
+        self._scheduler = scheduler
+        self._tasks = tasks
+        self._ha_restrictions = None if ha_restrictions is None else MappingProxyType({key: tuple(value) if isinstance(value, (list, tuple)) else value for key, value in ha_restrictions.items()})
+        self._fact_reader = fact_reader
+        self._ha_manifest = ha_manifest
+        self._ha_preview = ha_preview
+        self._action_ledger = action_ledger
+        self._fake_action_dispatch = fake_action_dispatch
+        self._ha_execution = ha_execution
+        if configuration is not None and not configuration.synchronized_by(synchronization):
+            raise ValueError("configuration and lifecycle must share synchronization")
+        self._configuration = configuration
+        self._policy_revision = 1
+        self._recovery_failed = False
+
+    def activate_action_policy(self, *, expected_revision: int, manifest: BuiltInManifest, restrictions: Mapping[str, object] | None = None) -> bool:
+        """Application-only CAS seam; production configuration remains restart-applied."""
+        with self._synchronization.locked():
+            if expected_revision != self._policy_revision:
+                return False
+            self._ha_manifest = replace(manifest, targets=frozenset(manifest.targets), read_fields=frozenset(manifest.read_fields))
+            self._ha_restrictions = None if restrictions is None else MappingProxyType({key: tuple(value) if isinstance(value, (list, tuple, frozenset)) else value for key, value in restrictions.items()})
+            self._policy_revision += 1
+            self._synchronization.notify_all()
+            return True
+
+    def _policy_locked(self) -> tuple[tuple[int, int], Mapping[str, object] | None, BuiltInManifest]:
+        if self._configuration is None:
+            return (0, self._policy_revision), self._ha_restrictions, self._ha_manifest
+        policy = self._configuration.action_policy()
+        manifest = replace(self._ha_manifest, enabled=self._ha_manifest.enabled and not policy.disabled)
+        operator = compute_effective_policy(policy.restrictions, manifest).policy
+        local = compute_effective_policy(self._ha_restrictions, manifest).policy
+        restrictions = {"invalid_restrictions": True} if operator is None or local is None else {
+            "targets": tuple(operator.targets & local.targets),
+            "read_fields": tuple(operator.read_fields & local.read_fields),
+        }
+        return (policy.revision, self._policy_revision), MappingProxyType(restrictions), manifest
 
     def run_fake_turn(self, text: str, startup: StartupState) -> TurnResult:
         if not startup.ready:
@@ -148,6 +220,8 @@ class TextGateway:
             session = self._sessions.get(session_id)
             if session is None:
                 raise AdmissionError(404, "session_unavailable", "conflict_or_expired_reference", "Session is unavailable.")
+            if self._recovery_failed:
+                raise _ledger_unavailable_error()
             if not startup.ready:
                 raise AdmissionError(409, "service_unready", "conflict_or_expired_reference", "Service is unavailable.", True)
             if any(request.session_id == session_id and request.context_generation == session.context_generation and request.outcome is None for request in self._requests.values()):
@@ -187,10 +261,23 @@ class TextGateway:
                 )
             except RequestLedgerUnavailable:
                 raise AdmissionError(503, "request_ledger_unavailable", "dependency_unavailable", "Request status storage is unavailable.", True) from None
+            request.admitted_monotonic = self._monotonic()
+            route_started = self._monotonic()
+            decision = select_fast_route(text, model_input.messages[:-1], self._proposal_deadline())
+            duration_ms = max(0, round((self._monotonic() - route_started) * 1000))
             self._requests[request.request_id] = request
             if request.queued:
                 self._queued_request_ids.append(request.request_id)
-        return self._stream(request, model_input, text, supplied_context)
+        try:
+            self._telemetry.emit("route_selected", RouteTelemetry(request.request_id, request.session_id, request.trace_id, decision.route, decision.rule_revision, duration_ms).fields())
+        except Exception:
+            pass
+        if decision.route == "qwen":
+            try:
+                self._schedule_acknowledgement(request)
+            except Exception:
+                request.startup_failure = "scheduler"
+        return self._stream(request, model_input, text, supplied_context, decision)
 
     def reset_session(self, session_id: str) -> Session:
         with self._synchronization.locked():
@@ -241,6 +328,7 @@ class TextGateway:
             request = self._requests.get(request_id)
             if request is not None and request.outcome is None:
                 request.cancellation.cancel()
+                self._cancel_acknowledgement_locked(request)
                 if request.queued:
                     self._remove_queued_locked(request.request_id)
                 self._synchronization.notify_all()
@@ -256,7 +344,18 @@ class TextGateway:
     def deliver_stream_event(self, event: StreamEvent, deliver: Callable[[StreamEvent], None]) -> bool:
         """Serialize useful stream delivery with cancellation acknowledgement."""
         with self._synchronization.locked():
-            if event.type in {"content_delta", "proposal"}:
+            if event.type == "action_state":
+                request = self._requests.get(event.request_id)
+                state = event.action_state or {}
+                if request is None:
+                    return False
+                if self._is_fenced_locked(request) and not (
+                    request.committed_action is not None
+                    and state.get("action_id") == request.committed_action.action_id
+                    and state.get("state") in {"reserved", "fake_attempted", "outcome_unknown", "confirmed", "denied", "failed"}
+                ):
+                    return False
+            if event.type in {"ack", "content_delta", "proposal", "fact", "validation"}:
                 request = self._requests.get(event.request_id)
                 if request is None or self._is_fenced_locked(request):
                     return False
@@ -264,35 +363,45 @@ class TextGateway:
             return True
 
     def recover_interrupted_requests(self) -> None:
-        """Fail admitted work from an earlier process without replaying it."""
-        self._ledger.recover_interrupted()
+        """Recover action evidence before request status, without any replay."""
+        with self._synchronization.locked():
+            self._recovery_failed = True
+            recover_actions_and_requests(self._action_ledger, self._ledger, self._clock.now())
+            for request in self._requests.values():
+                request.cancellation.cancel()
+            self._recovery_failed = False
 
-    def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...]) -> Iterator[StreamEvent]:
+    def _stream(self, request: _Request, model_input: ModelInput, text: str, supplied_context: tuple[ModelMessage, ...], decision: FastRoute) -> Iterator[StreamEvent]:
         yield self._event(request, "accepted")
-        route_started = self._monotonic()
-        decision = select_fast_route(text, model_input.messages[:-1], self._proposal_deadline())
-        duration_ms = max(0, round((self._monotonic() - route_started) * 1000))
-        try:
-            self._telemetry.emit("route_selected", RouteTelemetry(request.request_id, request.session_id, request.trace_id, decision.route, decision.rule_revision, duration_ms).fields())
-        except Exception:
-            pass
+        if request.startup_failure is not None:
+            yield self._error(request, "stream_start_failed", "internal_failure", "Request processing is unavailable.", True)
+            yield self._terminal(request, "failed")
+            return
         if decision.route != "qwen":
             yield from self._stream_fast_route(request, text, supplied_context, decision)
             return
-        admission = self._await_start(request)
-        if admission == "cancelled":
-            yield self._terminal(request, "cancelled")
-            return
-        if admission == "deadline":
-            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+        model = self._model
+        if not hasattr(model, "stream"):
+            yield self._error(request, "model_unavailable", "dependency_unavailable", "Model streaming is unavailable.", True)
             yield self._terminal(request, "failed")
             return
-        try:
-            model = self._model
-            if not hasattr(model, "stream"):
-                yield self._error(request, "model_unavailable", "dependency_unavailable", "Model streaming is unavailable.", True)
+        if self._tasks is None:
+            admission = self._await_start(request)
+            if admission == "cancelled":
+                yield self._terminal(request, "cancelled")
+                return
+            if admission == "deadline":
+                yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
                 yield self._terminal(request, "failed")
                 return
+        else:
+            try:
+                self._tasks.start(lambda: self._pump_provider_stream(request, model, model_input))
+            except Exception:
+                yield self._error(request, "stream_start_failed", "internal_failure", "Request processing is unavailable.", True)
+                yield self._terminal(request, "failed")
+                return
+        try:
             saw_outcome = False
             saw_content = False
             saw_proposal = False
@@ -301,6 +410,10 @@ class TextGateway:
             provider_stream: Iterator[object] | None = None
             first_provider_item = True
             while True:
+                acknowledgement = self._pending_acknowledgement(request)
+                if acknowledgement is not None:
+                    yield acknowledgement
+                    continue
                 if self._is_fenced(request):
                     yield self._terminal(request, "cancelled")
                     return
@@ -309,12 +422,32 @@ class TextGateway:
                     yield self._terminal(request, "failed")
                     return
                 try:
-                    if first_provider_item and request.queued_at_admission:
+                    if self._tasks is not None:
+                        item = self._next_pumped_item(request)
+                        if item is _ACK_WAKE:
+                            acknowledgement = self._pending_acknowledgement(request)
+                            if acknowledgement is not None:
+                                yield acknowledgement
+                            continue
+                        if item is _PUMP_CANCELLED:
+                            yield self._terminal(request, "cancelled")
+                            return
+                        if item is _PUMP_DEADLINE:
+                            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                            yield self._terminal(request, "failed")
+                            return
+                        if item is _PUMP_DONE:
+                            break
+                        if isinstance(item, BaseException):
+                            raise item
+                    elif first_provider_item and request.queued_at_admission:
                         provider_stream = self._start_queued_provider_stream(request, model, model_input)
-                    else:
+                        item = next(provider_stream)
+                        first_provider_item = False
+                    elif self._tasks is None:
                         provider_stream = iter(model.stream(model_input, request.cancellation)) if provider_stream is None else provider_stream  # type: ignore[union-attr]
-                    item = next(provider_stream)
-                    first_provider_item = False
+                        item = next(provider_stream)
+                        first_provider_item = False
                 except StopIteration:
                     if self._is_fenced(request):
                         yield self._terminal(request, "cancelled")
@@ -331,6 +464,9 @@ class TextGateway:
                     yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
                     yield self._terminal(request, "failed")
                     return
+                acknowledgement = self._pending_acknowledgement(request)
+                if acknowledgement is not None:
+                    yield acknowledgement
                 if isinstance(item, ModelChunk):
                     if saw_proposal:
                         yield self._error(request, "invalid_stream", "uncertainty", "Model output is unavailable.", False)
@@ -342,6 +478,7 @@ class TextGateway:
                         yield self._terminal(request, "failed")
                         return
                     streamed_bytes += byte_count
+                    self._record_first_model_token(request)
                     saw_content = True
                     delta = self._content_delta(request, item.content)
                     if delta is None:
@@ -354,13 +491,67 @@ class TextGateway:
                         yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
                         yield self._terminal(request, "outcome_unknown")
                         return
-                    proposal = self._admit_proposal(request, item.proposal)
-                    if proposal is None:
-                        yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
-                        yield self._terminal(request, "outcome_unknown")
+                    if is_ha_fact_candidate(item.proposal):
+                        fact = self._read_fact(request, item.proposal)
+                        if fact is None:
+                            if self._is_fenced(request):
+                                yield self._terminal(request, "cancelled")
+                                return
+                            yield self._error(request, "ha_fact_denied", "policy_denial", "The requested home fact is unavailable.", False)
+                            yield self._terminal(request, "denied")
+                            return
+                        saw_proposal = True
+                        yield fact
+                        rendered = _render_home_fact(fact.fact)
+                        delta = self._content_delta(request, rendered)
+                        if delta is None:
+                            yield self._terminal(request, "cancelled")
+                            return
+                        saw_content = True
+                        response_parts.append(rendered)
+                        yield delta
+                        continue
+                    admitted = self._admit_proposal(request, item.proposal)
+                    if admitted is None:
+                        if is_ha_shaped_candidate(item.proposal):
+                            yield self._error(request, "ha_proposal_denied", "policy_denial", "The proposed action is unavailable.", False)
+                            yield self._terminal(request, "denied")
+                        else:
+                            yield self._error(request, "invalid_proposal", "uncertainty", "Model proposal is unavailable.", False)
+                            yield self._terminal(request, "outcome_unknown")
                         return
                     saw_proposal = True
+                    proposal, canonical_preview = admitted
                     yield proposal
+                    if canonical_preview is not None:
+                        preview_event, terminal_outcome, preview_succeeded = self._preview_ha_proposal(request, canonical_preview)
+                        if preview_event is None:
+                            yield self._terminal(request, "cancelled")
+                            return
+                        yield preview_event
+                        if terminal_outcome is not None:
+                            yield self._terminal(request, terminal_outcome)
+                            return
+                        if preview_succeeded:
+                            action_events, action_outcome = self._reserve_fake_action(request, canonical_preview)
+                            yield from action_events
+                            if action_outcome is not None:
+                                yield self._terminal(request, action_outcome)
+                                return
+                        record_result, terminal = self._complete_turn(request, text, supplied_context, "")
+                        if record_result == "fenced":
+                            yield self._terminal(request, "cancelled")
+                        elif record_result == "deadline":
+                            yield self._error(request, "model_deadline", "timeout", "Model did not complete before its deadline.", True)
+                            yield self._terminal(request, "failed")
+                        elif record_result == "limit":
+                            yield self._error(request, "transcript_limit", "internal_failure", "Response exceeded a context limit.", False)
+                            yield self._terminal(request, "failed")
+                        elif terminal is not None:
+                            yield terminal
+                        else:
+                            raise RuntimeError("completed preview is missing its terminal event")
+                        return
                 elif isinstance(item, ModelOutcome):
                     if saw_outcome:
                         yield self._error(request, "invalid_outcome", "uncertainty", "Model outcome is unavailable.", False)
@@ -430,14 +621,59 @@ class TextGateway:
             yield self._error(request, decision.error_code or "fast_route_denied", decision.error_category or "policy_denial", decision.error_message or "This request is not allowed.", False)
             yield self._terminal(request, "denied")
             return
+        if decision.route == "execution":
+            admitted = self._admit_proposal(request, decision.proposal or {})
+            if admitted is None:
+                yield self._action_state_event(request, {"state": "denied", "readiness": "ready", "result": ActionExecutionResult("denied", "prerequisite_unmet").payload()})
+                yield self._terminal(request, "denied")
+                return
+            proposal_event, canonical = admitted
+            yield proposal_event
+            events, outcome = self._reserve_fake_action(request, canonical, execute=True)
+            yield from events
+            yield self._terminal(request, outcome or "completed")
+            return
         if decision.route == "proposal":
-            proposal = self._admit_proposal(request, decision.proposal or {})
-            if proposal is None:
+            admitted = self._admit_proposal(request, decision.proposal or {})
+            if admitted is None:
                 yield self._error(request, "fast_proposal_denied", "policy_denial", "The proposed action is unavailable.", False)
                 yield self._terminal(request, "denied")
                 return
+            proposal, canonical_preview = admitted
             yield proposal
+            if canonical_preview is not None:
+                preview_event, terminal_outcome, preview_succeeded = self._preview_ha_proposal(request, canonical_preview)
+                if preview_event is None:
+                    yield self._terminal(request, "cancelled")
+                    return
+                yield preview_event
+                if terminal_outcome is not None:
+                    yield self._terminal(request, terminal_outcome)
+                    return
+                if preview_succeeded:
+                    action_events, action_outcome = self._reserve_fake_action(request, canonical_preview)
+                    yield from action_events
+                    if action_outcome is not None:
+                        yield self._terminal(request, action_outcome)
+                        return
             result, terminal = self._complete_turn(request, text, supplied_context, "", enforce_deadline=False)
+        elif decision.route == "fact":
+            fact = self._read_fact(request, decision.fact_request or {})
+            if fact is None:
+                if self._is_fenced(request):
+                    yield self._terminal(request, "cancelled")
+                    return
+                yield self._error(request, "ha_fact_denied", "policy_denial", "The requested home fact is unavailable.", False)
+                yield self._terminal(request, "denied")
+                return
+            yield fact
+            rendered = _render_home_fact(fact.fact)
+            delta = self._content_delta(request, rendered)
+            if delta is None:
+                yield self._terminal(request, "cancelled")
+                return
+            yield delta
+            result, terminal = self._complete_turn(request, text, supplied_context, rendered, enforce_deadline=False)
         else:
             content = decision.content
             if decision.route not in {"content", "clarification", "limitation"} or content is None:
@@ -481,12 +717,26 @@ class TextGateway:
         if request.cancellation.is_cancelled() or request.outcome == "cancelled" or (outcome != "cancelled" and (session is None or session.context_generation != request.context_generation)):
             outcome = "cancelled"
         try:
-            self._ledger.mark_terminal(request.request_id, outcome)
+            if request.committed_action is not None and request.committed_action.state in {"reserved", "outcome_unknown"}:
+                outcome = "outcome_unknown"
+            outcome = self._ledger.mark_terminal(request.request_id, outcome) or outcome
         except RequestLedgerUnavailable:
-            outcome = "failed"
+            outcome = "outcome_unknown" if request.committed_action is not None else "failed"
+            if self._action_ledger is not None:
+                self._action_ledger.degrade()
+                if request.committed_action is not None:
+                    try:
+                        request.committed_action = self._action_ledger.mark_outcome_unknown(request.committed_action.action_id, self._clock.now())
+                    except ActionLedgerUnavailable:
+                        pass
         request.terminal_emitted = True
         request.outcome = outcome
+        request.cancellation.cancel()
+        self._cancel_acknowledgement_locked(request)
+        request.pending_provider_items.clear()
+        self._synchronization.notify_all()
         event = self._event(request, "terminal", outcome=outcome)
+        self._emit_timing("terminal", request)
         self._requests.pop(request.request_id, None)
         self._remove_queued_locked(request.request_id)
         self._promote_queued_locked()
@@ -496,19 +746,296 @@ class TextGateway:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
                 return None
+            self._mark_useful_output_locked(request)
             return self._event(request, "content_delta", content=content)
 
     def _proposal_event(self, request: _Request, proposal: Mapping[str, object]) -> StreamEvent | None:
         with self._synchronization.locked():
             if self._is_fenced_locked(request):
                 return None
+            self._mark_useful_output_locked(request)
             return self._event(request, "proposal", proposal=proposal)
 
-    def _admit_proposal(self, request: _Request, proposal: Mapping[str, object]) -> StreamEvent | None:
+    def _fact_event(self, request: _Request, fact: BoundedHomeFact) -> StreamEvent | None:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return None
+            self._mark_useful_output_locked(request)
+            return self._event(request, "fact", fact=fact.payload())
+
+    def _read_fact(self, request: _Request, candidate: object) -> StreamEvent | None:
+        """Use the closed fact validator before the sole read adapter can run."""
+        validation = validate_ha_fact_request(candidate, self._ha_restrictions)
+        if validation.request is None:
+            try:
+                self._telemetry.emit("ha_fact_denied", {"code": validation.denial_code or "invalid_fact_request"})
+            except Exception:
+                pass
+            return None
+        fact = BoundedHomeFact.unavailable()
+        if self._fact_reader is not None:
+            try:
+                supplied = self._fact_reader.read(validation.request)
+                fact = supplied if type(supplied) is BoundedHomeFact else BoundedHomeFact.unavailable()
+            except Exception:
+                fact = BoundedHomeFact.unavailable()
+        return self._fact_event(request, fact)
+
+    def _admit_proposal(self, request: _Request, proposal: Mapping[str, object]) -> tuple[StreamEvent, CanonicalProposal | None] | None:
         """Apply the one application proposal boundary shared by every route."""
+        with self._synchronization.locked():
+            return self._admit_proposal_locked(request, proposal)
+
+    def _admit_proposal_locked(self, request: _Request, proposal: Mapping[str, object]) -> tuple[StreamEvent, CanonicalProposal | None] | None:
+        if is_ha_shaped_candidate(proposal):
+            revision, restrictions, manifest = self._policy_locked()
+            result = preview_eligibility(proposal, restrictions, manifest)
+            if result.denial_code is not None:
+                try:
+                    self._telemetry.emit("ha_proposal_denied", {"code": result.denial_code})
+                except Exception:
+                    pass
+                return None
+            if result.material is None:
+                return None
+            event = self._proposal_event(request, _canonical_proposal_payload(result.material))
+            if event is None:
+                return None
+            request.validated_policy_revision = revision
+            return event, result.material
         if not validate_proposal(proposal) or not proposal_event_size_is_bounded(proposal):
             return None
-        return self._proposal_event(request, proposal)
+        event = self._proposal_event(request, proposal)
+        return None if event is None else (event, None)
+
+    def _preview_ha_proposal(self, request: _Request, proposal: CanonicalProposal) -> tuple[StreamEvent | None, str | None, bool]:
+        """Preview through the inward adapter; this path never reaches tools."""
+        if self._is_fenced(request):
+            return None, "cancelled", False
+        if self._ha_preview is None:
+            result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
+        else:
+            try:
+                result = self._ha_preview.preview(proposal)
+            except Exception:
+                result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
+        if type(result) is not DryRunPreview or not _preview_matches_proposal(result, proposal):
+            result = DryRunPreview("unavailable", None, None, None, None, "adapter_unavailable")
+        if self._is_fenced(request):
+            return None, "cancelled", False
+        preview = _preview_payload(result)
+        event = self._validation_event(request, preview)
+        if result.status == "simulated":
+            return event, None, True
+        return event, "denied" if result.status == "denied" else "failed", False
+
+    def _reserve_fake_action(self, request: _Request, proposal: CanonicalProposal, *, execute: bool = False) -> tuple[tuple[StreamEvent, ...], str | None]:
+        """Commit reservation and required audit under the lifecycle/policy lock."""
+        if self._action_ledger is None or (self._ha_execution is None if execute else self._fake_action_dispatch is None):
+            return (), "denied" if execute else None
+        with self._synchronization.locked():
+            self._expire_sessions_locked()
+            if self._is_fenced_locked(request):
+                return (), "cancelled"
+            if self._deadline_expired_locked(request):
+                return (), "failed"
+            revision, restrictions, manifest = self._policy_locked()
+            candidate = {"operation": proposal.operation, "target": proposal.target, "arguments": proposal.argument_object()}
+            eligibility = (execution_eligibility if execute else preview_eligibility)(candidate, restrictions, manifest)
+            if request.validated_policy_revision != revision or eligibility.material != proposal:
+                return (self._action_state_event(request, {"state": "denied", "readiness": "ready", "result": ActionExecutionResult("denied", "prerequisite_unmet").payload()}),), "denied"
+            if self._recovery_failed or self._action_ledger.readiness().state != "ready":
+                return (self._action_state_event(request, {"state": "denied", "readiness": "degraded"}),), "denied"
+            execution_deadline = min(self._monotonic() + 5, request.deadline_at)
+            session_expires_at = self._sessions[request.session_id].created_at + MAX_SESSION_SECONDS
+            record = _new_action_record(request, proposal, self._clock.now())
+            try:
+                reservation = self._action_ledger.reserve_and_audit(record)
+            except ActionLedgerUnavailable:
+                self._action_ledger.degrade()
+                return (self._action_state_event(request, {"state": "denied", "readiness": "degraded"}),), "denied"
+            reservation_event = self._action_state_event(request, _action_state_payload(reservation.status, reservation.record, self._action_ledger.readiness().state))
+            request.committed_action = reservation.record
+            if reservation.status == "conflict":
+                return (reservation_event,), "denied"
+            if reservation.status == "duplicate":
+                return (reservation_event,), ({"confirmed": "completed", "denied": "denied", "failed": "failed", "fake_attempted": None}.get(reservation.record.state, "outcome_unknown"))
+            if self._deadline_expired_locked(request) or self._monotonic() >= session_expires_at or (execute and self._monotonic() >= execution_deadline):
+                self._expire_sessions_locked()
+                result = self._unknown_committed_locked(request, reservation.record)
+                return (reservation_event, result), "outcome_unknown"
+        if execute:
+            try:
+                result = self._ha_execution.execute(ActionExecutionRequest(proposal, execution_deadline))
+                if type(result) is not ActionExecutionResult:
+                    result = ActionExecutionResult("outcome_unknown", "transport_unknown")
+                elif self._monotonic() >= execution_deadline:
+                    result = ActionExecutionResult("outcome_unknown", "deadline", result.evidence, result.power_state, result.observed_at)
+                elif result.status == "confirmed" and result.power_state != proposal.argument_object()["desired_state"]:
+                    result = ActionExecutionResult("outcome_unknown", "observation_mismatch")
+            except Exception:
+                result = ActionExecutionResult("outcome_unknown", "transport_unknown")
+            with self._synchronization.locked():
+                try:
+                    observed = self._action_ledger.mark_execution_result(reservation.record.action_id, self._clock.now(), result)
+                except Exception:
+                    unknown_event = self._unknown_committed_locked(request, reservation.record, degrade=True)
+                    return (reservation_event, unknown_event), "outcome_unknown"
+                request.committed_action = observed
+                event = self._action_state_event(request, _action_state_payload(observed.state, observed, self._action_ledger.readiness().state))
+                return (reservation_event, event), {"confirmed": "completed", "denied": "denied", "failed": "failed"}.get(observed.state, "outcome_unknown")
+        # Never hold lifecycle locks over fake I/O. Persist results/readiness under the lock.
+        failed = False
+        try:
+            self._fake_action_dispatch.attempt(reservation.record)
+        except Exception:
+            failed = True
+        with self._synchronization.locked():
+            if not failed:
+                try:
+                    attempted = self._action_ledger.mark_fake_attempt(reservation.record.action_id, self._clock.now())
+                except Exception:
+                    failed = True
+            if failed:
+                result = self._unknown_committed_locked(request, reservation.record, degrade=True)
+                return (reservation_event, result), "outcome_unknown"
+            request.committed_action = attempted
+            result = self._action_state_event(request, _action_state_payload(attempted.state, attempted, self._action_ledger.readiness().state))
+            return (reservation_event, result), "outcome_unknown" if attempted.state == "outcome_unknown" else None
+
+    def _unknown_committed_locked(self, request: _Request, record: ActionRecord, *, degrade: bool = False) -> StreamEvent:
+        if degrade:
+            self._action_ledger.degrade()
+        try:
+            unknown = self._action_ledger.mark_outcome_unknown(record.action_id, self._clock.now())
+        except ActionLedgerUnavailable:
+            self._action_ledger.degrade()
+            unknown = replace(record, state="outcome_unknown")
+        request.committed_action = unknown
+        return self._action_state_event(request, _action_state_payload("outcome_unknown", unknown, self._action_ledger.readiness().state))
+
+    def _action_state_event(self, request: _Request, state: Mapping[str, object]) -> StreamEvent:
+        with self._synchronization.locked():
+            return self._event(request, "action_state", action_state=state)
+
+    def _validation_event(self, request: _Request, preview: Mapping[str, object]) -> StreamEvent | None:
+        with self._synchronization.locked():
+            if self._is_fenced_locked(request):
+                return None
+            self._mark_useful_output_locked(request)
+            return self._event(request, "validation", preview=preview)
+
+    def _schedule_acknowledgement(self, request: _Request) -> None:
+        """Arm the one non-authoritative acknowledgement from durable admission."""
+        if self._scheduler is None:
+            return
+        delay = max(0.0, request.admitted_monotonic + ACK_DELAY_SECONDS - self._monotonic())
+        request.acknowledgement = self._scheduler.schedule(delay, lambda: self._acknowledgement_due(request))
+
+    def _acknowledgement_due(self, request: _Request) -> None:
+        with self._synchronization.locked():
+            if request.terminal_emitted or self._is_fenced_locked(request) or request.useful_output_emitted:
+                return
+            request.acknowledgement_pending = True
+            if self._tasks is not None and len(request.pending_provider_items) < MAX_PENDING_PROVIDER_ITEMS:
+                request.pending_provider_items.append(_ACK_WAKE)
+            self._synchronization.notify_all()
+
+    def _pump_provider_stream(self, request: _Request, model: ModelPort, model_input: ModelInput) -> None:
+        """Move blocking provider reads outside application event serialization."""
+        try:
+            admission = self._await_start(request)
+            if admission == "cancelled":
+                self._append_pumped_item(request, _PUMP_CANCELLED)
+                return
+            if admission == "deadline":
+                self._append_pumped_item(request, _PUMP_DEADLINE)
+                return
+            if request.queued_at_admission:
+                stream = self._start_queued_provider_stream(request, model, model_input)
+            else:
+                stream = iter(model.stream(model_input, request.cancellation))  # type: ignore[union-attr]
+            for item in stream:
+                if not self._append_pumped_item(request, item):
+                    return
+        except Exception as failure:
+            self._append_pumped_item(request, failure)
+        finally:
+            self._append_pumped_item(request, _PUMP_DONE)
+
+    def _append_pumped_item(self, request: _Request, item: object) -> bool:
+        with self._synchronization.locked():
+            while len(request.pending_provider_items) >= MAX_PENDING_PROVIDER_ITEMS:
+                if request.terminal_emitted or self._is_fenced_locked(request):
+                    return False
+                self._synchronization.wait()
+            if request.terminal_emitted or self._is_fenced_locked(request):
+                return False
+            if _provider_item_is_useful(item):
+                self._mark_useful_output_locked(request)
+            elif item is _PUMP_DONE or isinstance(item, (ModelOutcome, BaseException)) or not isinstance(item, (ModelChunk, ModelProposal)):
+                self._cancel_acknowledgement_locked(request)
+            request.pending_provider_items.append(item)
+            self._synchronization.notify_all()
+            return True
+
+    def _next_pumped_item(self, request: _Request) -> object:
+        with self._synchronization.locked():
+            while not request.pending_provider_items:
+                if self._is_fenced_locked(request):
+                    return _PUMP_CANCELLED
+                remaining = request.deadline_at - self._monotonic()
+                if remaining <= 0:
+                    return _PUMP_DEADLINE
+                self._synchronization.wait(remaining)
+            item = request.pending_provider_items.popleft()
+            self._synchronization.notify_all()
+            return item
+
+    def _pending_acknowledgement(self, request: _Request) -> StreamEvent | None:
+        with self._synchronization.locked():
+            if not request.acknowledgement_pending or request.acknowledgement_emitted:
+                return None
+            if self._is_fenced_locked(request) or request.terminal_emitted or request.useful_output_emitted:
+                self._cancel_acknowledgement_locked(request)
+                return None
+            request.acknowledgement_pending = False
+            request.acknowledgement_emitted = True
+            event = self._event(request, "ack", message=ACK_MESSAGE)
+            self._emit_timing("acknowledgement", request)
+            return event
+
+    def _mark_useful_output_locked(self, request: _Request) -> None:
+        request.useful_output_emitted = True
+        self._cancel_acknowledgement_locked(request)
+        if not request.first_useful_content_recorded:
+            request.first_useful_content_recorded = True
+            self._emit_timing("first_useful_content", request)
+
+    def _record_first_model_token(self, request: _Request) -> None:
+        with self._synchronization.locked():
+            if request.first_model_token_recorded:
+                return
+            request.first_model_token_recorded = True
+            self._emit_timing("first_model_token", request)
+
+    def _cancel_acknowledgement_locked(self, request: _Request) -> None:
+        request.acknowledgement_pending = False
+        if request.acknowledgement is not None:
+            request.acknowledgement.cancel()
+            request.acknowledgement = None
+
+    def _emit_timing(self, event: str, request: _Request) -> None:
+        """Emit correlation and elapsed time only; never include streamed material."""
+        try:
+            self._telemetry.emit(event, {
+                "request_id": request.request_id,
+                "session_id": request.session_id,
+                "trace_id": request.trace_id,
+                "duration_ms": str(max(0, round((self._monotonic() - request.admitted_monotonic) * 1000))),
+            })
+        except Exception:
+            pass
 
     def _complete_turn(self, request: _Request, text: str, supplied_context: tuple[ModelMessage, ...], response: str, enforce_deadline: bool = True) -> tuple[str, StreamEvent | None]:
         with self._synchronization.locked():
@@ -532,7 +1059,8 @@ class TextGateway:
 
     def _is_fenced_locked(self, request: _Request) -> bool:
         session = self._sessions.get(request.session_id)
-        return request.cancellation.is_cancelled() or request.outcome == "cancelled" or session is None or session.context_generation != request.context_generation
+        policy_changed = request.committed_action is not None and request.validated_policy_revision != self._policy_locked()[0]
+        return policy_changed or request.cancellation.is_cancelled() or request.outcome is not None or session is None or session.context_generation != request.context_generation
 
     def _await_start(self, request: _Request) -> str:
         """Wait at the application boundary; queued work never reaches the model."""
@@ -646,6 +1174,7 @@ class TextGateway:
         for request in self._requests.values():
             if request.session_id == session_id and request.context_generation == generation and request.outcome is None:
                 request.cancellation.cancel()
+                self._cancel_acknowledgement_locked(request)
                 if request.queued:
                     self._remove_queued_locked(request.request_id)
         self._synchronization.notify_all()
@@ -663,6 +1192,99 @@ def _utf8_length(value: object) -> int | None:
         return len(value.encode("utf-8"))
     except UnicodeError:
         return None
+
+
+def _render_home_fact(fact: Mapping[str, str | None] | None) -> str:
+    """Render the bounded observation without naming a provider or target."""
+    if fact is None or fact.get("freshness") == "unavailable":
+        return "The reviewed home fact is unavailable."
+    state = fact.get("power_state")
+    observed_at = fact.get("observed_at")
+    freshness = fact.get("freshness")
+    if state not in {"on", "off"} or not isinstance(observed_at, str):
+        return "The reviewed home fact is unavailable."
+    if freshness == "fresh":
+        return f"The reviewed home fact is fresh: power is {state}, observed at {observed_at}."
+    return f"The reviewed home fact is stale: power was {state}, observed at {observed_at}."
+
+
+def _canonical_proposal_payload(proposal: CanonicalProposal) -> dict[str, object]:
+    """Publish only the canonical reviewed operation material."""
+    return {
+        "operation": proposal.operation,
+        "target": proposal.target,
+        "arguments": proposal.argument_object(),
+        "manifest_revision": proposal.manifest_revision,
+    }
+
+
+def _preview_payload(result: DryRunPreview) -> dict[str, object]:
+    """Publish the closed simulated result without a state-change claim."""
+    payload: dict[str, object] = {"status": result.status}
+    if result.status == "simulated":
+        payload.update({
+            "operation": result.operation,
+            "target": result.target,
+            "arguments": {"desired_state": result.desired_state},
+            "manifest_revision": result.manifest_revision,
+        })
+    else:
+        payload["reason"] = result.reason
+    return payload
+
+
+def _preview_matches_proposal(result: DryRunPreview, proposal: CanonicalProposal) -> bool:
+    """Keep an adapter result from contradicting the admitted canonical proposal."""
+    return result.status != "simulated" or (
+        result.operation == proposal.operation
+        and result.target == proposal.target
+        and result.desired_state == proposal.argument_object().get("desired_state")
+        and result.manifest_revision == proposal.manifest_revision
+    )
+
+
+def _new_action_record(request: _Request, proposal: CanonicalProposal, occurred_at: str) -> ActionRecord:
+    """Hash canonical material; never retain prompts, raw arguments, or labels."""
+    fields = (
+        CAPABILITY_ID, proposal.manifest_revision, proposal.operation, proposal.target,
+        *(value for pair in sorted(proposal.arguments) for value in pair),
+    )
+    # Length-prefix the typed string fields so separators in values cannot collide.
+    material = b"oriel-action-v1:" + b"".join(
+        str(len(encoded)).encode("ascii") + b":" + encoded
+        for encoded in (value.encode("utf-8") for value in fields)
+    )
+    fingerprint = hashlib.sha256(material).hexdigest()
+    action_id = "action-" + hashlib.sha256(f"{request.request_id}:{fingerprint}".encode("utf-8")).hexdigest()
+    return ActionRecord(action_id, request.request_id, request.trace_id, proposal.manifest_revision, CAPABILITY_ID, fingerprint, "reserved", occurred_at, occurred_at)
+
+
+def _action_state_payload(state: str, record: ActionRecord, readiness: str) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "state": state,
+        "action_id": record.action_id,
+        "request_id": record.request_id,
+        "trace_id": record.trace_id,
+        "manifest_revision": record.manifest_revision,
+        "capability_id": record.capability_id,
+        "readiness": readiness,
+    }
+    if record.result is not None:
+        payload["result"] = record.result.payload()
+    if state in {"duplicate", "conflict"}:
+        payload["existing_state"] = record.state
+    return payload
+
+
+def _provider_item_is_useful(item: object) -> bool:
+    """Recognize only output that can become a useful public stream event."""
+    if isinstance(item, ModelChunk):
+        size = _utf8_length(item.content)
+        return size is not None and 0 < size <= MAX_STREAM_EVENT_CONTENT_BYTES
+    return isinstance(item, ModelProposal) and (
+        is_ha_shaped_candidate(item.proposal)
+        or validate_proposal(item.proposal) and proposal_event_size_is_bounded(item.proposal)
+    )
 
 
 def _safe_model_failure(failure: ModelOperationFailure) -> tuple[str, str, str, bool]:

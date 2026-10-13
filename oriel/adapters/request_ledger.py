@@ -54,16 +54,18 @@ class SQLiteRequestLedger:
         except (OSError, sqlite3.Error, ValueError):
             raise RequestLedgerUnavailable() from None
 
-    def mark_terminal(self, request_id: str, outcome: str) -> None:
+    def mark_terminal(self, request_id: str, outcome: str) -> str:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                cursor = connection.execute(
-                    "UPDATE request_ledger SET state = 'terminal', outcome = ? WHERE request_id = ?",
+                connection.execute(
+                    "UPDATE request_ledger SET state = 'terminal', outcome = ? WHERE request_id = ? AND state = 'in_progress'",
                     (outcome, request_id),
                 )
-                if cursor.rowcount != 1:
+                row = connection.execute("SELECT outcome FROM request_ledger WHERE request_id = ?", (request_id,)).fetchone()
+                if row is None:
                     raise sqlite3.DatabaseError("missing request")
+                return row[0]
         except (OSError, sqlite3.Error):
             raise RequestLedgerUnavailable() from None
 
@@ -84,10 +86,12 @@ class SQLiteRequestLedger:
             raise RequestLedgerUnavailable() from None
         return RequestStatusRecord(*row) if row is not None else None
 
-    def recover_interrupted(self) -> None:
+    def recover_interrupted(self, committed_request_ids: tuple[str, ...] = ()) -> None:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                for request_id in committed_request_ids:
+                    connection.execute("UPDATE request_ledger SET state = 'terminal', outcome = 'outcome_unknown' WHERE request_id = ? AND state = 'in_progress'", (request_id,))
                 connection.execute("UPDATE request_ledger SET state = 'terminal', outcome = 'failed' WHERE state = 'in_progress'")
         except (OSError, sqlite3.Error):
             raise RequestLedgerUnavailable() from None

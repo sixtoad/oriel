@@ -24,7 +24,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/SessionId'}]
       requestBody: {required: true, content: {application/json: {schema: {$ref: './schemas/turn.json'}}}}
       responses:
-        '200': {description: Accepted non-replayable stream, content: {text/event-stream: {schema: {$ref: './schemas/event.json'}}}}
+        '200': {description: 'Accepted non-replayable stream; reviewed facts carry freshness evidence; harmless-light validation previews are simulated. Action-state events report reservations for the test-only fake seam and never claim a home action completed; production action I/O remains disabled. An optional pre-useful-output ack carries only message: Work is continuing. and never states completion or approval', content: {text/event-stream: {schema: {$ref: './schemas/event.json'}}}}
         '400': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}

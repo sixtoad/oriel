@@ -6,6 +6,8 @@ import re
 import unicodedata
 from typing import Iterable, Literal, Mapping
 
+from ..domain.ha_manifest import canonical_ha_fact_request, canonical_ha_proposal
+
 from .ports import ModelMessage
 
 
@@ -35,13 +37,14 @@ class NormalizedTurn:
 class FastRoute:
     """A typed decision that is independent of transport and providers."""
 
-    route: Literal["content", "clarification", "limitation", "denial", "proposal", "qwen"]
+    route: Literal["content", "clarification", "limitation", "denial", "proposal", "fact", "execution", "qwen"]
     rule_revision: str = RULE_REVISION
     content: str | None = None
     error_code: str | None = None
     error_category: str | None = None
     error_message: str | None = None
     proposal: Mapping[str, object] | None = None
+    fact_request: Mapping[str, object] | None = None
 
 
 def normalize_turn(text: str, context: Iterable[ModelMessage]) -> NormalizedTurn:
@@ -56,6 +59,8 @@ def route(text: str, context: Iterable[ModelMessage], proposal_deadline: str | N
 
     if _PROTECTED.search(request) or _has_multiple_actions(request):
         return FastRoute("denial", error_code="fast_route_denied", error_category="policy_denial", error_message="This request is not allowed.")
+    if request == "what is the reviewed harmless light status":
+        return FastRoute("fact", fact_request=canonical_ha_fact_request())
     if _LIVE_WEATHER.search(request):
         return FastRoute("limitation", content="Live weather lookup is unsupported.")
     if _LIVE_TIME.search(request):
@@ -64,6 +69,10 @@ def route(text: str, context: Iterable[ModelMessage], proposal_deadline: str | N
         return FastRoute("limitation", content="Music playback is unsupported.")
     if _LIVE_HOME_STATE.search(request):
         return FastRoute("limitation", content="Live home-state lookup is unsupported.")
+    if request in {"turn on the reviewed harmless light", "turn off the reviewed harmless light"}:
+        return FastRoute("execution", proposal=canonical_ha_proposal(request.split()[1]))
+    if request in {"create a reviewed harmless light proposal on", "create a reviewed harmless light proposal off"}:
+        return FastRoute("proposal", proposal=canonical_ha_proposal(request.rsplit(" ", 1)[1]))
     if request == "create a synthetic proposal":
         if proposal_deadline is None:
             raise ValueError("synthetic proposals require an application deadline")

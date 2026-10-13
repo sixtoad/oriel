@@ -12,6 +12,7 @@
     {
       "api_version": "1.0",
       "context_generation": 0,
+      "message": "Work is continuing.",
       "request_id": "req-1",
       "seq": 2,
       "session_id": "ses-1",
